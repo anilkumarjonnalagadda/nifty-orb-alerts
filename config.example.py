@@ -1,0 +1,8 @@
+KITE_API_KEY = "your_api_key"
+KITE_API_SECRET = "your_api_secret"
+
+TELEGRAM_BOT_TOKEN = "your_bot_token"
+TELEGRAM_CHAT_ID = "your_chat_id"
+
+VOLUME_MULTIPLIER = 1.2
+LOOKBACK_CANDLES = 20
