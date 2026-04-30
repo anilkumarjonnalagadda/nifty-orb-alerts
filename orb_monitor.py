@@ -114,14 +114,18 @@ def main():
         f"Watching 3-min closes for breakout/breakdown..."
     )
 
-    fired = {"UP": False, "DOWN": False}
+    max_fires = config.MAX_FIRES_PER_DIRECTION
+    state = {
+        "UP": {"fires": 0, "needs_reset": False},
+        "DOWN": {"fires": 0, "needs_reset": False},
+    }
     next_check = next_3min_boundary()
 
     while now_ist() < market_close:
         wait_until(next_check)
         next_check += timedelta(minutes=3)
 
-        if fired["UP"] and fired["DOWN"]:
+        if state["UP"]["fires"] >= max_fires and state["DOWN"]["fires"] >= max_fires:
             time.sleep(5)
             continue
 
@@ -149,39 +153,53 @@ def main():
         vwap_str = f"{vwap:.2f}" if vwap else "n/a"
         vol_ratio = (last["volume"] / avg_vol) if avg_vol > 0 else 0
 
-        if not fired["UP"] and close > orb_high and vol_ok and (vwap is None or close > vwap):
+        if state["UP"]["needs_reset"] and close <= orb_high:
+            state["UP"]["needs_reset"] = False
+        if state["DOWN"]["needs_reset"] and close >= orb_low:
+            state["DOWN"]["needs_reset"] = False
+
+        up_armed = (not state["UP"]["needs_reset"]) and state["UP"]["fires"] < max_fires
+        down_armed = (not state["DOWN"]["needs_reset"]) and state["DOWN"]["fires"] < max_fires
+
+        if up_armed and close > orb_high and vol_ok and (vwap is None or close > vwap):
+            state["UP"]["fires"] += 1
+            state["UP"]["needs_reset"] = True
             try:
                 spot = kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
             except Exception:
                 spot = close
             opt = atm_option_symbol(spot, "UP", instruments_nfo)
             send_alert(
-                f"BREAKOUT (UP)\n"
+                f"BREAKOUT (UP) — fire {state['UP']['fires']}/{max_fires}\n"
                 f"{fut_symbol} 3m close: {close} > ORB High {orb_high}\n"
                 f"Vol: {last['volume']} (avg {avg_vol:.0f}, x{vol_ratio:.2f})\n"
                 f"VWAP: {vwap_str}\n"
                 f"Spot Nifty: {spot}\n"
                 f"BUY CE: {opt}"
             )
-            fired["UP"] = True
 
-        if not fired["DOWN"] and close < orb_low and vol_ok and (vwap is None or close < vwap):
+        if down_armed and close < orb_low and vol_ok and (vwap is None or close < vwap):
+            state["DOWN"]["fires"] += 1
+            state["DOWN"]["needs_reset"] = True
             try:
                 spot = kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
             except Exception:
                 spot = close
             opt = atm_option_symbol(spot, "DOWN", instruments_nfo)
             send_alert(
-                f"BREAKDOWN (DOWN)\n"
+                f"BREAKDOWN (DOWN) — fire {state['DOWN']['fires']}/{max_fires}\n"
                 f"{fut_symbol} 3m close: {close} < ORB Low {orb_low}\n"
                 f"Vol: {last['volume']} (avg {avg_vol:.0f}, x{vol_ratio:.2f})\n"
                 f"VWAP: {vwap_str}\n"
                 f"Spot Nifty: {spot}\n"
                 f"BUY PE: {opt}"
             )
-            fired["DOWN"] = True
 
-    send_alert("Market closed. ORB monitor stopping.")
+    send_alert(
+        f"Market closed. ORB monitor stopping.\n"
+        f"Fires today — UP: {state['UP']['fires']}/{max_fires}, "
+        f"DOWN: {state['DOWN']['fires']}/{max_fires}"
+    )
 
 
 if __name__ == "__main__":
