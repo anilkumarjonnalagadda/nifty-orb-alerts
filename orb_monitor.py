@@ -76,6 +76,43 @@ def next_3min_boundary():
     return base
 
 
+# FIX #1 — replaces the broken "minute % 3 == 0" check (always True for Nifty,
+# so the candles_3m[-2] fallback was dead code and partial candles were used).
+def select_last_closed_candle(candles_3m, now):
+    """Return the most recent candle whose full 3-minute window has elapsed."""
+    return next(
+        (c for c in reversed(candles_3m) if c["date"] + timedelta(minutes=3) <= now),
+        None,
+    )
+
+
+# FIX #3 — extracted so the re-arm conditions are unit-testable in isolation.
+def update_rearm_state(state, close, orb_high, orb_low):
+    """Reset arm flags once price pulls back meaningfully inside the ORB."""
+    if state["UP"]["needs_reset"] and close < orb_high - config.REARM_BUFFER:
+        state["UP"]["needs_reset"] = False
+    if state["DOWN"]["needs_reset"] and close > orb_low + config.REARM_BUFFER:
+        state["DOWN"]["needs_reset"] = False
+
+
+# FIX #2 + FIX #6 — buffer guards against fakeouts; elif enforces mutual exclusion.
+def evaluate_signal(close, orb_high, orb_low, vol_ok, vwap, up_armed, down_armed):
+    """Return 'UP', 'DOWN', or None for the current 3-min close."""
+    if up_armed and close > orb_high + config.BREAKOUT_BUFFER and vol_ok and (vwap is None or close > vwap):
+        return "UP"
+    elif down_armed and close < orb_low - config.BREAKOUT_BUFFER and vol_ok and (vwap is None or close < vwap):
+        return "DOWN"
+    return None
+
+
+def compute_vol_filter(last_candle, prior_candles):
+    """Return (vol_ok, avg_vol) based on lookback window."""
+    recent = prior_candles[-config.LOOKBACK_CANDLES:]
+    avg_vol = sum(c["volume"] for c in recent) / len(recent) if recent else 0
+    vol_ok = last_candle["volume"] > config.VOLUME_MULTIPLIER * avg_vol if avg_vol > 0 else True
+    return vol_ok, avg_vol
+
+
 def main():
     kite = get_kite()
     fut, instruments_nfo = get_nifty_fut(kite)
@@ -103,7 +140,15 @@ def main():
         send_alert("ERROR: ORB candle unavailable. Exiting.")
         return
 
+    # FIX #4 — validate that the candle Kite returned actually starts at 9:15 AM.
     orb = orb_candles[0]
+    if orb["date"].time() != dtime(9, 15):
+        send_alert(
+            f"ERROR: ORB candle starts at {orb['date'].time()}, expected 09:15. "
+            f"Data may be from pre-open session. Exiting."
+        )
+        return
+
     orb_high = orb["high"]
     orb_low = orb["low"]
 
@@ -111,6 +156,7 @@ def main():
         f"ORB formed for {fut_symbol}\n"
         f"High: {orb_high}\n"
         f"Low: {orb_low}\n"
+        f"Buffer: {config.BREAKOUT_BUFFER} pts | Re-arm: {config.REARM_BUFFER} pts\n"
         f"Watching 3-min closes for breakout/breakdown..."
     )
 
@@ -140,12 +186,13 @@ def main():
         if not candles_3m or len(candles_3m) < 2:
             continue
 
-        last = candles_3m[-1] if candles_3m[-1]["date"].minute % 3 == 0 else candles_3m[-2]
-        prior = [c for c in candles_3m if c["date"] < last["date"]]
+        # FIX #1 — use the time-based helper instead of the broken % 3 check.
+        last = select_last_closed_candle(candles_3m, now)
+        if last is None:
+            continue
 
-        recent = prior[-config.LOOKBACK_CANDLES:]
-        avg_vol = sum(c["volume"] for c in recent) / len(recent) if recent else 0
-        vol_ok = last["volume"] > config.VOLUME_MULTIPLIER * avg_vol if avg_vol > 0 else True
+        prior = [c for c in candles_3m if c["date"] < last["date"]]
+        vol_ok, avg_vol = compute_vol_filter(last, prior)
 
         vwap = compute_vwap(candles_1m) if candles_1m else None
         close = last["close"]
@@ -153,15 +200,16 @@ def main():
         vwap_str = f"{vwap:.2f}" if vwap else "n/a"
         vol_ratio = (last["volume"] / avg_vol) if avg_vol > 0 else 0
 
-        if state["UP"]["needs_reset"] and close <= orb_high:
-            state["UP"]["needs_reset"] = False
-        if state["DOWN"]["needs_reset"] and close >= orb_low:
-            state["DOWN"]["needs_reset"] = False
+        # FIX #3 — re-arm requires a REARM_BUFFER pullback, not just touching the level.
+        update_rearm_state(state, close, orb_high, orb_low)
 
         up_armed = (not state["UP"]["needs_reset"]) and state["UP"]["fires"] < max_fires
         down_armed = (not state["DOWN"]["needs_reset"]) and state["DOWN"]["fires"] < max_fires
 
-        if up_armed and close > orb_high and vol_ok and (vwap is None or close > vwap):
+        # FIX #2 + FIX #6 — BREAKOUT_BUFFER threshold; elif prevents simultaneous fires.
+        signal = evaluate_signal(close, orb_high, orb_low, vol_ok, vwap, up_armed, down_armed)
+
+        if signal == "UP":
             state["UP"]["fires"] += 1
             state["UP"]["needs_reset"] = True
             try:
@@ -171,14 +219,14 @@ def main():
             opt = atm_option_symbol(spot, "UP", instruments_nfo)
             send_alert(
                 f"BREAKOUT (UP) — fire {state['UP']['fires']}/{max_fires}\n"
-                f"{fut_symbol} 3m close: {close} > ORB High {orb_high}\n"
+                f"{fut_symbol} 3m close: {close} > ORB High {orb_high} (+{config.BREAKOUT_BUFFER} buf)\n"
                 f"Vol: {last['volume']} (avg {avg_vol:.0f}, x{vol_ratio:.2f})\n"
                 f"VWAP: {vwap_str}\n"
                 f"Spot Nifty: {spot}\n"
                 f"BUY CE: {opt}"
             )
 
-        if down_armed and close < orb_low and vol_ok and (vwap is None or close < vwap):
+        elif signal == "DOWN":
             state["DOWN"]["fires"] += 1
             state["DOWN"]["needs_reset"] = True
             try:
@@ -188,7 +236,7 @@ def main():
             opt = atm_option_symbol(spot, "DOWN", instruments_nfo)
             send_alert(
                 f"BREAKDOWN (DOWN) — fire {state['DOWN']['fires']}/{max_fires}\n"
-                f"{fut_symbol} 3m close: {close} < ORB Low {orb_low}\n"
+                f"{fut_symbol} 3m close: {close} < ORB Low {orb_low} (-{config.BREAKOUT_BUFFER} buf)\n"
                 f"Vol: {last['volume']} (avg {avg_vol:.0f}, x{vol_ratio:.2f})\n"
                 f"VWAP: {vwap_str}\n"
                 f"Spot Nifty: {spot}\n"
