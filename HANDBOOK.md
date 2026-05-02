@@ -1,27 +1,50 @@
-# Nifty ORB Alert System — Handbook
+# Nifty ORB Alert System — Handbook (V2)
 
-Your daily operating manual for the breakout alert bot running on AWS Lightsail.
+Your daily operating manual for the breakout alert + 1-tap order bot running on AWS Lightsail.
 
 ---
 
 ## What this system does
 
-Every trading day, this bot watches the **Nifty current-month futures contract** on Zerodha and tells you (via Telegram) when price makes a clean breakout from the **first 15-minute range** of the day.
+Every trading day, this bot watches the **Nifty current-month futures contract** on Zerodha and tells you (via Telegram) when price makes a clean breakout from the **first 15-minute range** of the day. When a signal fires, the alert comes with a **tappable BUY button** that places an ITM-1 option order at a marketable LIMIT price — one tap, one lot, done.
 
-- **ORB window:** 9:15–9:30 IST. The high and low of that single 15-min candle become your levels.
-- **Watch period:** 9:30 AM – 3:30 PM IST. Every 3 minutes, the latest candle close is checked.
-- **Trigger:** A 3-min close above ORB high → buy ATM weekly **CE**. A close below ORB low → buy ATM weekly **PE**.
+- **ORB window:** 9:15–9:30 IST. The high and low of that 15-min candle become your levels.
+- **Watch period:** 9:30 AM – 3:30 PM IST. Every **5 minutes** (V2 — was 3 min in V1), the latest candle close is checked.
+- **Trigger:** A 5-min close above ORB high → buy **ITM-1 CE** (one strike below spot, ~0.65 delta). A close below ORB low → buy **ITM-1 PE** (one strike above spot).
 - **Filters (to cut noise):**
-  - Volume on the breakout candle must be > **1.2×** the average of the last 20 three-minute candles.
+  - Volume on the breakout candle must be > **1.2×** the average of the last 20 five-minute candles.
   - Close must be on the right side of intraday VWAP (above for UP, below for DOWN).
-- **Re-fires:** Up to **2 alerts per direction per day**. After fire #1, the system waits for price to come back inside the ORB range (a "reset") before re-arming. Catches clean re-entries without spam.
-- **You execute the trades manually.** The bot only alerts. It will never place an order in V1.
+- **Re-fires:** Up to **2 alerts per direction per day**. After fire #1, price must pull back into the ORB by ≥ 15 pts before the system re-arms.
+- **One-tap order:** Each breakout alert includes an inline button: `BUY 65 CE @ ₹152.95`. Tap it → bot places a LIMIT order via Kite. You still manage stop-loss and exits manually.
+- **Safety guards:** auto-order is **skipped** (with a "place manually" note) when option spread > 5%, premium > ₹500, or quote depth is missing.
+
+---
+
+## Pre-flight: the DRY_RUN flag
+
+The bot ships with `DRY_RUN = True` in `config.py`. In this mode:
+
+- All alerts and buttons appear normally on Telegram
+- When you tap the button, the bot **logs** the order it would have placed and confirms back: `[DRY_RUN] Order placed: NIFTY26MAY24450CE BUY 65 @ LIMIT ₹152.95`
+- **No real money moves**
+
+**Run for one full trading day in DRY_RUN.** Verify each alert: is the symbol right (correct expiry, correct CE/PE), is the strike one ITM (50 pts in the money for Nifty), is the price near the visible Kite quote? Once you've seen 2-3 clean alerts pass that check, flip the flag:
+
+```bash
+ssh ubuntu@<lightsail-ip>
+cd ~/nifty-orb-alerts
+nano config.py        # change DRY_RUN = True  →  DRY_RUN = False
+pkill -f orb_monitor.py
+nohup python orb_monitor.py > orb.log 2>&1 &
+```
+
+The startup Telegram message will now say `ORB monitor started (LIVE)` instead of `(DRY_RUN)`.
 
 ---
 
 ## Daily morning ritual
 
-Every trading day, you'll get **two Telegram messages from the system before market open**:
+You'll get **two Telegram messages from the system before market open**:
 
 ### 8:30 AM IST — Token refresh nudge
 
@@ -41,10 +64,10 @@ https://kite.zerodha.com/connect/login?api_key=XXX&v=3
    nohup python orb_monitor.py > orb.log 2>&1 &
 ```
 
-### Steps to follow (takes ~60 seconds)
+### Steps to follow (~60 seconds)
 
-1. **Tap the Kite login link** in the Telegram message → log in with your Zerodha credentials + 2FA.
-2. After login, you land on a page (might look broken — that's fine). **Copy the full URL** from the browser address bar — it contains `request_token=...`.
+1. **Tap the Kite login link** in the Telegram message → log in with Zerodha + 2FA.
+2. After login, you land on a page that may look broken — that's fine. **Copy the full URL** from the browser address bar (it contains `request_token=...`).
 3. **SSH to Lightsail** from your laptop or AWS browser-based SSH:
    ```bash
    ssh ubuntu@<lightsail-ip>
@@ -57,84 +80,146 @@ https://kite.zerodha.com/connect/login?api_key=XXX&v=3
    ```bash
    nohup python orb_monitor.py > orb.log 2>&1 &
    ```
-6. Within a minute, you should get a Telegram alert: `ORB monitor started`. If yes — you're done. Walk away.
+6. Within a minute, you should get a Telegram alert: `ORB monitor started (DRY_RUN)` or `(LIVE)`. If yes — you're done. **Close the SSH window. The bot keeps running.**
 
-### If you don't get the "ORB monitor started" message
+### Why the bot keeps running after you close SSH
 
-Something failed. SSH back in and check:
-```bash
-tail -50 orb.log
-```
-Most common causes are listed in **Troubleshooting** below.
+This is the part most people ask about, so here's the plain explanation:
+
+- `nohup` (= "no hangup") tells Linux: "if my session ends, don't kill this process."
+- The trailing `&` puts it in the background so the shell prompt comes back immediately.
+- `> orb.log 2>&1` sends both normal output and errors into the file `orb.log` so the process doesn't try to write to a terminal that's gone.
+
+**Net effect:** you can close the SSH window, close your laptop lid, fly across the country — the bot keeps running on the Lightsail VM until either:
+- You explicitly kill it (see "Daily shutdown" below), or
+- The VM itself reboots (rare; AWS usually warns you).
+
+If your VM does reboot, the bot will **not** restart automatically — see the optional **systemd setup** at the end of this handbook to fix that.
 
 ---
 
 ## What the alerts mean
 
-You'll get one of these messages over the day. Treat each as a **signal to evaluate**, not a blind buy.
-
 ### "ORB monitor started"
-Confirmation the bot is alive and watching. No action.
+Confirmation the bot is alive. Includes mode (DRY_RUN/LIVE), futures symbol, lot size. No action.
 
 ### "ORB formed" (around 9:30:30 AM)
 ```
 ORB formed for NIFTY24MAYFUT
 High: 22687.40
 Low: 22641.25
-Watching 3-min closes for breakout/breakdown...
+Buffer: 10 pts | Re-arm: 15 pts
+Watching 5-min closes for breakout/breakdown...
 ```
-Now you know the day's range. **Note these levels mentally.** Wider ranges (>80 points) often mean choppier days.
+Your day's range is set. Wider ranges (>80 pts) often mean choppier days — be more selective.
 
-### "BREAKOUT (UP) — fire 1/2" (the real signal)
+### "BREAKOUT (UP) — fire 1/2" — the real signal with a button
 ```
 BREAKOUT (UP) — fire 1/2
-NIFTY24MAYFUT 3m close: 22693.10 > ORB High 22687.40
+NIFTY24MAYFUT 5m close: 22693.10 > ORB High 22687.40 (+10 buf)
 Vol: 142500 (avg 89200, x1.60)
 VWAP: 22669.85
 Spot Nifty: 22691.55
-BUY CE: NIFTY2450822700CE
+ITM-1 CE: NIFTY24MAY22650CE
+Bid/Ask: 152.10/152.45
+LIMIT: ₹152.95
+
+[ BUY 65 CE @ ₹152.95 ]   ← tap to place order
 ```
-- **fire 1/2** = first breakout of the day in this direction
-- **x1.60** = breakout candle had 1.6× the average volume — strong
-- **VWAP** = if price is well above VWAP, trend is supported
-- **BUY CE: ...** = the ATM weekly call option to buy
+
+- **fire 1/2** = first breakout in this direction today
+- **x1.60** = breakout candle volume was 1.6× the 20-candle avg — strong
+- **ITM-1 CE** = 50 pts in the money (better delta than ATM for short holds)
+- **Bid/Ask** = the live option quote at the moment the alert fired
+- **LIMIT ₹152.95** = `best_ask + 0.50` rounded to 0.05 tick — almost guaranteed to fill at the visible ask
+
+**Tap the button** → bot places a BUY LIMIT order via Kite → confirmation message comes back:
+```
+Order placed: NIFTY24MAY22650CE BUY 65 @ LIMIT ₹152.95
+Order ID: 250502000123456
+```
+
+If the order fails (margin, rejected, network), you'll see:
+```
+ORDER FAILED for NIFTY24MAY22650CE: <error message from Kite>
+```
+…and you can place the trade manually in Kite.
 
 ### "BREAKDOWN (DOWN) — fire 1/2"
-Same shape, but opposite — buy the suggested PE.
+Same shape but opposite — buys an ITM-1 PE (50 pts above spot).
 
 ### "fire 2/2"
-A re-entry breakout after price came back inside ORB range and broke out again. Often **cleaner than fire 1** because the noise has been shaken out. Take it seriously.
+A re-entry breakout after price came back inside ORB by ≥15 pts. Often **cleaner than fire 1** because the noise has been shaken out.
+
+### "Auto-order skipped" (any reason)
+You'll see this if the safety guards rejected the auto-order:
+- `spread 7.2% > 5%` — option spread too wide; place manually with a tight limit
+- `premium ₹620 > MAX_PREMIUM ₹500` — option too expensive (often deep ITM after a big move)
+- `quote fetch failed: ...` — Kite API hiccup; refresh and place manually
+
+The alert still fires — you just don't get the button.
 
 ### "Market closed. ORB monitor stopping."
-End of day at 3:30 PM. Shows total fires. No action.
+End of day at 3:30 PM. Shows total fires.
 
 ---
 
-## What to do when an alert fires (your trading checklist)
+## Your trading checklist (still applies)
 
-The bot tells you *what looks like a setup*. The decision to trade is yours. Run this 30-second checklist:
+The button tap places the **entry**. Stops, exits, sizing — still your job:
 
-1. **Check Nifty chart on Kite** — is price genuinely outside the ORB on multiple timeframes, or is this one suspicious candle?
-2. **Check the option's bid-ask spread** — if it's wider than 2-3 rupees on a near-ATM strike, liquidity is poor; skip or use a limit order.
-3. **Define your stop loss before entry.** Standard rule: stop on the option = 30-40% of premium paid. On the futures level = re-entry into ORB range.
-4. **Position size.** Risk per trade ≤ 1-2% of trading capital. Calculate quantity = (risk amount) / (premium × stop %).
-5. **Place the trade.** Limit order at LTP or slightly worse. Avoid market orders on options.
-6. **Set a target.** Common: 1.5× to 2× the risk (i.e., target premium = entry × 1.5).
-7. **Don't average down.** If it goes against you to your stop, take the loss. Move on.
+1. **Define stop-loss before the position fills.** Standard rule: stop on the option = 30–40% of premium paid. On the futures level = re-entry into ORB range (use a Kite GTT for this).
+2. **Position size sanity.** 1 lot of Nifty at premium ₹150 = ₹9,750 capital deployed. Stop at 30% = ₹2,925 risk. That should be ≤ 1–2% of trading capital. If it's more, **don't tap the button — the bot doesn't know your account size.**
+3. **Set a target** before the trade goes anywhere. Common: 1.5×–2× the risk.
+4. **Don't average down** if it goes against you.
+
+---
+
+## Daily shutdown (after market close)
+
+The bot auto-sends `Market closed. ORB monitor stopping.` at 3:30 PM and the main loop exits. **But the Python process may still be alive** for a few seconds (the Telegram listener thread is a daemon and dies with the process — but only when the main thread exits cleanly).
+
+Verify and clean up:
+
+```bash
+ssh ubuntu@<lightsail-ip>
+ps aux | grep orb_monitor | grep -v grep
+```
+
+If you see a line, kill it:
+```bash
+pkill -f orb_monitor.py
+```
+
+Then verify it's gone:
+```bash
+ps aux | grep orb_monitor | grep -v grep
+```
+Empty output = clean.
+
+**Why this matters:** if you start tomorrow's session without killing today's process, you'll have **two bots running**, doubled alerts, and possibly two BUY orders on the same button tap. Always kill before starting fresh.
 
 ---
 
 ## Tuning the filters
 
-All filter thresholds live in `config.py` on the Lightsail box. Edit, save, restart the monitor.
+All thresholds live in `config.py` on the Lightsail box. Edit, save, restart.
 
 | Setting | Default | What it does | When to change |
 |---|---|---|---|
-| `VOLUME_MULTIPLIER` | `1.2` | Breakout vol must be ≥ this × the last-20-candle avg | Increase to `1.5` if you're getting weak signals; decrease to `1.0` if you're missing valid moves |
-| `LOOKBACK_CANDLES` | `20` | Number of recent 3-min candles for the volume average | Rarely needs changing |
-| `MAX_FIRES_PER_DIRECTION` | `2` | Max alerts per direction per day | Set to `1` for ultra-conservative; `3` if you want every clean re-break |
+| `VOLUME_MULTIPLIER` | `1.2` | Breakout vol must be ≥ this × the 20-candle avg | Up to `1.5` for stricter; down to `1.0` if missing valid moves |
+| `LOOKBACK_CANDLES` | `20` | Number of recent 5-min candles for the volume average | Rarely needs changing |
+| `MAX_FIRES_PER_DIRECTION` | `2` | Max alerts per direction per day | `1` for ultra-conservative; `3` if you want every clean re-break |
+| `BREAKOUT_BUFFER` | `10` | Pts beyond ORB needed to count as a breakout | Higher = fewer fakeouts but later entries |
+| `REARM_BUFFER` | `15` | Pts back inside ORB needed before re-arm | Higher = stricter re-entry filter |
+| `LOT_SIZE` | `65` | Nifty lot size (NSE-defined) | Update if NSE changes the lot size |
+| `LIMIT_BUFFER` | `0.50` | ₹ above best ask for the BUY limit | Higher = more fill certainty, slightly worse price |
+| `MAX_SPREAD_PCT` | `0.05` | Skip auto-order if (ask−bid)/mid > this | Lower for stricter liquidity filter |
+| `MAX_PREMIUM` | `500` | Skip auto-order if option premium > this | Catches expensive far-from-spot options |
+| `ORDER_PRODUCT` | `"MIS"` | MIS = intraday auto-squareoff | Use `"NRML"` only if carrying overnight |
+| `DRY_RUN` | `True` | Log instead of placing real orders | Flip to `False` after one clean DRY_RUN day |
 
-After editing `config.py`, you must restart the monitor:
+**After editing `config.py`:**
 ```bash
 pkill -f orb_monitor.py
 nohup python orb_monitor.py > orb.log 2>&1 &
@@ -148,13 +233,13 @@ nohup python orb_monitor.py > orb.log 2>&1 &
 ```bash
 tail -100 orb.log
 ```
-Look for the error. Common ones:
+Common errors:
 
 | Error contains | Fix |
 |---|---|
-| `No valid access token for today` | You forgot to run `python auth.py`. Run it. |
+| `No valid access token for today` | You forgot `python auth.py`. Run it. |
 | `TokenException` | Token expired or wrong API key/secret. Re-run `auth.py`. |
-| `connection`, `timeout`, `network` | Lightsail momentarily lost network. Restart: `nohup python orb_monitor.py > orb.log 2>&1 &` |
+| `connection`, `timeout`, `network` | Lightsail momentarily lost network. Restart. |
 | `No active Nifty futures found` | Holiday or expiry edge case. Check NSE calendar. |
 
 ### Telegram alerts not arriving
@@ -162,37 +247,94 @@ Look for the error. Common ones:
 python -c "from telegram_alert import send_alert; send_alert('test')"
 ```
 - Nothing on phone → bot token wrong, or you blocked the bot, or chat ID wrong.
-- Get `Telegram send failed: ...` → the error tells you what's wrong.
+- Get `Telegram send failed: ...` → the error tells you.
 
-### Monitor seems hung / no breakout alerts even though Nifty clearly broke ORB
-- Most likely the **filters rejected it** — check `orb.log` for that candle's volume + VWAP at the time.
-- This is by design. If it happens often, lower `VOLUME_MULTIPLIER` to `1.0` or `1.1`.
+### Tapped the button but no order/confirmation came back
+1. Check `orb.log` — look for `Callback handler error:` or `ORDER FAILED`.
+2. Most likely cause: the access token expired mid-day (rare; tokens last ~24h). Re-run `auth.py`, restart the bot. The button you already tapped won't be retried — place that one manually.
+3. Could also be that the bot process died. `ps aux | grep orb_monitor | grep -v grep` — if empty, restart.
 
-### Process is still running from yesterday
+### "Auto-order skipped" on every alert
+Spread or premium guards are too tight. Loosen `MAX_SPREAD_PCT` (e.g., to `0.07`) or raise `MAX_PREMIUM` (e.g., to `800`). Restart.
+
+### Process still running from yesterday
 ```bash
-ps aux | grep orb_monitor
+ps aux | grep orb_monitor | grep -v grep
 pkill -f orb_monitor.py
 ```
-Always kill before re-running. Otherwise you'll have two copies firing duplicate alerts.
+
+### Got two identical alerts within seconds
+Two bots running. `pkill -f orb_monitor.py` (kills both), then start fresh.
 
 ---
 
 ## Things you should NOT do
 
-- **Don't run `python auth.py` after market open.** It works, but you'll have missed the ORB and the script may already be exiting.
-- **Don't push `config.py` to GitHub.** It's in `.gitignore` for a reason. Your secrets stay on Lightsail.
+- **Don't flip `DRY_RUN = False` without one full day of dry-run validation.** Real money, irreversible orders.
+- **Don't run `python auth.py` after market open.** The bot may already be exiting.
+- **Don't push `config.py` to GitHub.** It's in `.gitignore`. Secrets stay on Lightsail.
 - **Don't paste your Kite API secret, access token, or TOTP into chats, screenshots, or anywhere outside `config.py`.** If you do — rotate immediately at https://developers.kite.trade/apps.
-- **Don't trade options without a stop loss.** Options decay; "let me just hold and see" is how accounts die.
-- **Don't let one losing day double your size the next day** to "recover."
+- **Don't tap a button after the alert is more than ~30 seconds old** — the underlying option price has moved and the LIMIT may now be too far below market to fill.
+- **Don't let one losing day double your size the next day** to "recover".
 
 ---
 
 ## Risk discipline (read once a week)
 
-- Options are leveraged. A 50% drop in the underlying option premium is **normal** and frequent.
-- The bot's win rate will not be 100%. Expect 40-55% winners. Profitability comes from average winner > average loser.
-- **Daily loss cap:** stop trading for the day after 2 consecutive losses or after losing 3% of capital, whichever comes first.
-- **Weekly review:** Sunday evening, review all alerts that fired vs. trades you took vs. P&L. Look for patterns (e.g., wide ORBs always lose, tight ORBs always win, etc.).
+- Options decay daily. A 50% drop in the option premium is normal and frequent.
+- Win rate will not be 100%. Expect 40–55% winners. Profitability comes from average winner > average loser.
+- **Daily loss cap:** stop trading after 2 consecutive losses or 3% of capital, whichever comes first.
+- **Weekly review:** Sunday evening, review every alert vs. trades you took vs. P&L. Look for patterns (wide ORBs lose, tight ORBs win, etc.).
+
+---
+
+## Optional: auto-restart with systemd
+
+If you want the bot to survive a Lightsail VM reboot without you SSHing in to start it manually, create a systemd service. **You still need to refresh the Kite token every morning** — systemd just handles the process lifecycle.
+
+One-time setup on the VM:
+
+```bash
+sudo tee /etc/systemd/system/orb-monitor.service > /dev/null <<'EOF'
+[Unit]
+Description=Nifty ORB Monitor
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nifty-orb-alerts
+ExecStart=/home/ubuntu/nifty-orb-alerts/venv/bin/python orb_monitor.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/ubuntu/nifty-orb-alerts/orb.log
+StandardError=append:/home/ubuntu/nifty-orb-alerts/orb.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable orb-monitor
+```
+
+Daily morning then becomes:
+```bash
+python auth.py                          # refresh token (still manual)
+sudo systemctl restart orb-monitor      # picks up the new token
+```
+
+Daily shutdown:
+```bash
+sudo systemctl stop orb-monitor
+```
+
+Status check:
+```bash
+sudo systemctl status orb-monitor
+```
+
+If you're not comfortable with systemd, **stick with `nohup`** — it works fine for daily manual operation.
 
 ---
 
@@ -200,10 +342,11 @@ Always kill before re-running. Otherwise you'll have two copies firing duplicate
 
 | Version | Status | What it adds |
 |---|---|---|
-| **V1** | Live | Telegram alerts only (this) |
+| **V1** | Done | Telegram alerts only |
 | **V1.5** | Done | Re-arm logic — up to 2 fires per direction |
-| **V2** | Planned | Auto-place CE/PE order with predefined SL & target. Manual confirmation toggle. |
-| **V3** | Maybe | Trailing SL, multi-symbol (BankNifty, FinNifty), holiday calendar, web dashboard |
+| **V2** | **Live now** | 5-min tracking; ITM-1 strike; 1-tap LIMIT order with safety guards; DRY_RUN flag |
+| **V3** | Planned | Auto stop-loss + target placement; trailing SL; multi-symbol (BankNifty, FinNifty) |
+| **V4** | Maybe | Holiday calendar, web dashboard, position dashboard with live P&L |
 
 ---
 
