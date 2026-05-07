@@ -50,7 +50,17 @@ DRY_RUN = True
 # The bot then monitors the option's bid every minute and "sells" at best-bid
 # when SL / TARGET / square-off time hits, recording everything in trades.db.
 # Use this to validate signal + exit logic against real ticks without risking
-# capital. PAPER_TRADE has no effect when DRY_RUN is True (the latter wins).
+# capital.
+#
+# PAPER_TRADE wins over DRY_RUN — the safety check inside place_buy_limit /
+# place_sell_limit returns BEFORE the kite.place_order call whenever
+# PAPER_TRADE is True, regardless of DRY_RUN. Mode truth table:
+#
+#   PAPER_TRADE  DRY_RUN  Mode      Kite order?  DB?  SL/target?
+#   True         True     PAPER     No           Yes  Yes
+#   True         False    PAPER     No           Yes  Yes
+#   False        True     DRY_RUN   No           No   No   (alert-only)
+#   False        False    LIVE      Yes          Yes  Yes
 PAPER_TRADE = True
 
 # Stop-loss as a fraction of the entry premium. 0.30 = exit if option mid drops
