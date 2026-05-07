@@ -43,3 +43,36 @@ ORDER_PRODUCT = "MIS"
 # Run for one full trading day to verify symbol/qty/price are sane,
 # then flip to False on the VM to go live.
 DRY_RUN = True
+
+# ── Paper trading + exit management (V3) ─────────────────────────────────────
+
+# When True, button taps simulate fills at the live best-ask (no Kite order).
+# The bot then monitors the option's bid every minute and "sells" at best-bid
+# when SL / TARGET / square-off time hits, recording everything in trades.db.
+# Use this to validate signal + exit logic against real ticks without risking
+# capital. PAPER_TRADE has no effect when DRY_RUN is True (the latter wins).
+PAPER_TRADE = True
+
+# Stop-loss as a fraction of the entry premium. 0.30 = exit if option mid drops
+# 30% below entry (e.g. enter at ₹100, exit at ₹70).
+SL_PCT = 0.30
+
+# Target (profit-take) as a fraction of the entry premium. 0.50 = exit at +50%.
+TARGET_PCT = 0.50
+
+# Hard square-off time. Any open position is exited at this IST time even if
+# SL/TARGET have not hit. Set well before market close so MIS auto-squareoff
+# does not race us. Default 15:15 IST (15 min before close).
+SQUARE_OFF_HOUR = 15
+SQUARE_OFF_MINUTE = 15
+
+# How often (seconds) to poll the option's quote when a position is open.
+# 60 = check exit conditions once per minute. Lower = tighter SL but more
+# Kite API calls. Note: the main signal-evaluation loop still runs at 5-min
+# boundaries; this is a separate cadence that only kicks in when holding.
+POSITION_POLL_SECONDS = 60
+
+# SQLite trade journal. Lives next to orb_monitor.py on the VM. Survives
+# process restart so today's open position can be recovered if you bounce
+# the bot mid-day.
+DB_PATH = "trades.db"
