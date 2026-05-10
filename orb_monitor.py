@@ -1,3 +1,5 @@
+import logging
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, time as dtime
@@ -15,6 +17,22 @@ from telegram_alert import (
 )
 
 IST = pytz.timezone("Asia/Kolkata")
+
+logger = logging.getLogger("orb")
+
+
+def _setup_logging():
+    """Configure stderr logging with IST timestamps. Idempotent."""
+    logging.Formatter.converter = lambda *_: datetime.now(IST).timetuple()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s IST %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def now_ist():
@@ -229,8 +247,7 @@ def place_buy_limit(kite, tradingsymbol, qty, price):
     if config.PAPER_TRADE:
         return f"paper-{int(time.time())}", None
     if config.DRY_RUN:
-        msg = f"DRY_RUN: would place BUY {qty} {tradingsymbol} @ LIMIT ₹{price}"
-        print(msg)
+        logger.info("DRY_RUN would BUY %s qty=%d @ LIMIT %.2f", tradingsymbol, qty, price)
         return f"dry-{int(time.time())}", None
     try:
         order_id = kite.place_order(
@@ -254,8 +271,7 @@ def place_sell_limit(kite, tradingsymbol, qty, price):
     if config.PAPER_TRADE:
         return f"paper-sell-{int(time.time())}", None
     if config.DRY_RUN:
-        msg = f"DRY_RUN: would place SELL {qty} {tradingsymbol} @ LIMIT ₹{price}"
-        print(msg)
+        logger.info("DRY_RUN would SELL %s qty=%d @ LIMIT %.2f", tradingsymbol, qty, price)
         return f"dry-sell-{int(time.time())}", None
     try:
         order_id = kite.place_order(
@@ -313,7 +329,7 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     try:
         q = kite.quote([f"NFO:{symbol}"])[f"NFO:{symbol}"]
     except Exception as e:
-        print(f"Position quote fetch failed: {e}")
+        logger.error("Position quote fetch failed for %s: %s", symbol, e)
         return None
 
     ltp = q.get("last_price")
@@ -325,6 +341,11 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     reason = decide_exit(
         position["entry_price"], ltp, now_ist(), square_off_time,
         config.SL_PCT, config.TARGET_PCT,
+    )
+    pnl_pct = (ltp - position["entry_price"]) / position["entry_price"] * 100
+    logger.info(
+        "position_tick %s entry=%.2f ltp=%.2f bid=%s pnl=%+.2f%% decision=%s",
+        symbol, position["entry_price"], ltp, bid, pnl_pct, reason or "HOLD",
     )
     if reason is None:
         return None
@@ -345,6 +366,12 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     with db_lock:
         pnl = trades_db.record_sell(conn, position["id"], recorded_exit, reason)
     tracker.close()
+
+    logger.info(
+        "EXIT reason=%s symbol=%s entry=%.2f exit=%.2f qty=%d pnl=%+.2f mode=%s",
+        reason, symbol, position["entry_price"], recorded_exit, position["qty"],
+        pnl, "PAPER" if config.PAPER_TRADE else "LIVE",
+    )
 
     mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
     send_alert(
@@ -413,6 +440,7 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
 
     _, err = place_buy_limit(kite, symbol, qty, price)
     if err:
+        logger.error("BUY order failed: symbol=%s qty=%d price=%.2f err=%s", symbol, qty, price, err)
         send_alert(f"ORDER FAILED for {symbol}: {err}")
         return
 
@@ -430,6 +458,11 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
         "id": entry_id, "symbol": symbol, "qty": qty,
         "entry_price": fill_price, "signal_type": signal_type, "mode": mode,
     })
+    logger.info(
+        "BUY filled mode=%s symbol=%s qty=%d entry=%.2f signal=%s sl=%.2f target=%.2f",
+        mode, symbol, qty, fill_price, signal_type,
+        fill_price * (1 - config.SL_PCT), fill_price * (1 + config.TARGET_PCT),
+    )
 
     mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
     send_alert(
@@ -453,7 +486,7 @@ def callback_listener(kite, stop_event, conn, db_lock, tracker):
                 try:
                     handle_callback(kite, cq, conn, db_lock, tracker)
                 except Exception as e:
-                    print(f"Callback handler error: {e}")
+                    logger.exception("Callback handler error: %s", e)
         if not updates:
             time.sleep(1)
 
@@ -462,6 +495,7 @@ def callback_listener(kite, stop_event, conn, db_lock, tracker):
 
 
 def main():
+    _setup_logging()
     kite = get_kite()
     fut, instruments_nfo = get_nifty_fut(kite)
     fut_token = fut["instrument_token"]
@@ -507,6 +541,12 @@ def main():
         mode = "DRY_RUN"
     else:
         mode = "LIVE"
+    logger.info(
+        "STARTUP mode=%s symbol=%s lot=%d product=%s sl=%.2f target=%.2f square_off=%02d:%02d",
+        mode, fut_symbol, config.LOT_SIZE, config.ORDER_PRODUCT,
+        config.SL_PCT, config.TARGET_PCT,
+        config.SQUARE_OFF_HOUR, config.SQUARE_OFF_MINUTE,
+    )
     send_alert(
         f"ORB monitor started ({mode})\n"
         f"Symbol: {fut_symbol}\n"
@@ -536,6 +576,11 @@ def main():
     orb_high = orb["high"]
     orb_low = orb["low"]
 
+    logger.info(
+        "ORB_FORMED symbol=%s high=%.2f low=%.2f range=%.2f buffer=%d rearm=%d",
+        fut_symbol, orb_high, orb_low, orb_high - orb_low,
+        config.BREAKOUT_BUFFER, config.REARM_BUFFER,
+    )
     send_alert(
         f"ORB formed for {fut_symbol}\n"
         f"High: {orb_high}\n"
@@ -571,7 +616,7 @@ def main():
             try:
                 monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_time)
             except Exception as e:
-                print(f"Position monitor error: {e}")
+                logger.exception("Position monitor error: %s", e)
 
         # 2. Signal evaluation — only on a 5-min boundary.
         if now < next_signal_check:
@@ -590,7 +635,7 @@ def main():
             candles_5m = kite.historical_data(fut_token, market_open, now, "5minute")
             candles_1m = kite.historical_data(fut_token, market_open, now, "minute")
         except Exception as e:
-            print(f"Data fetch failed: {e}")
+            logger.error("Historical data fetch failed: %s", e)
             continue
 
         if not candles_5m or len(candles_5m) < 2:
@@ -619,6 +664,16 @@ def main():
         # FIX #2 + FIX #6 + FIX #7 — buffer + elif + open-inside-ORB requirement.
         signal = evaluate_signal(
             last["open"], close, orb_high, orb_low, vol_ok, vwap, up_armed, down_armed,
+        )
+
+        logger.info(
+            "tick candle=%s open=%.2f close=%.2f orb_hi=%.2f orb_lo=%.2f "
+            "vol=%d avg=%.0f x%.2f vol_ok=%s vwap=%s up_armed=%s down_armed=%s "
+            "fires=U%d/D%d signal=%s",
+            last["date"].strftime("%H:%M"), last["open"], close, orb_high, orb_low,
+            last["volume"], avg_vol, vol_ratio, vol_ok, vwap_str,
+            up_armed, down_armed,
+            state["UP"]["fires"], state["DOWN"]["fires"], signal or "NONE",
         )
 
         if signal is None:
@@ -682,6 +737,13 @@ def main():
             f"Bid/Ask: {bid_ask}"
         )
 
+        logger.info(
+            "SIGNAL_FIRED dir=%s fire=%d/%d close=%.2f ref=%.2f spot=%.2f "
+            "opt=%s bid=%s ask=%s limit=%s reject=%s",
+            signal, fires_now, max_fires, close, ref_level, spot,
+            opt_symbol, bid, ask, limit_price, reject_reason or "none",
+        )
+
         if limit_price is not None:
             payload = encode_order_callback(opt_symbol, limit_price, config.LOT_SIZE)
             if config.PAPER_TRADE:
@@ -697,6 +759,10 @@ def main():
             send_alert(body + f"\nAuto-order skipped: {reject_reason}\nPlace manually.")
 
     stop_event.set()
+    logger.info(
+        "SHUTDOWN fires_up=%d/%d fires_down=%d/%d",
+        state["UP"]["fires"], max_fires, state["DOWN"]["fires"], max_fires,
+    )
     send_alert(
         f"Market closed. ORB monitor stopping.\n"
         f"Fires today — UP: {state['UP']['fires']}/{max_fires}, "
