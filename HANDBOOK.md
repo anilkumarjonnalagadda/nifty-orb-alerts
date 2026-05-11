@@ -1,4 +1,4 @@
-# Nifty ORB Alert System — Handbook (V2)
+# Nifty ORB Alert System — Handbook (V3)
 
 Your daily operating manual for the breakout alert + 1-tap order bot running on AWS Lightsail.
 
@@ -39,6 +39,49 @@ nohup python orb_monitor.py > orb.log 2>&1 &
 ```
 
 The startup Telegram message will now say `ORB monitor started (LIVE)` instead of `(DRY_RUN)`.
+
+---
+
+## Paper trading mode (V3)
+
+Before flipping `DRY_RUN = False` (which uses real money), run **`PAPER_TRADE = True`** for a couple of weeks. Paper mode is the realistic dress rehearsal:
+
+- All alerts fire normally on Telegram with BUY buttons.
+- When you tap the button, **no Kite order is placed** — but the bot:
+  1. Journals the trade in `trades.db` at the **alert-time LIMIT price** (same value LIVE will use).
+  2. Starts monitoring the position every minute (`POSITION_POLL_SECONDS = 60`).
+  3. Auto-exits on **SL** (premium drops 30%), **TARGET** (premium rises 50%), or **TIMEOUT** (15:15 IST square-off).
+  4. Sends a Telegram exit alert with realized P&L.
+
+This builds a full P&L history without risking capital. Mode truth table:
+
+| `PAPER_TRADE` | `DRY_RUN` | Mode | Real order? | DB row? | Auto-exit? |
+|---|---|---|---|---|---|
+| True | True | **PAPER** | No | Yes | Yes |
+| True | False | **PAPER** | No | Yes | Yes |
+| False | True | **DRY_RUN** | No | No | No (alert-only) |
+| False | False | **LIVE** | Yes | Yes | Yes |
+
+**Important:** `PAPER_TRADE` overrides `DRY_RUN`. To go live, set **both** to `False`.
+
+### How the journal records prices
+
+The journal records the price from the alert (e.g., `LIMIT: ₹152.95` shown on the BUY button), not the live ask at the moment you tap. This means:
+
+- **In LIVE**, your Kite LIMIT order is placed at exactly that price — fills land at or near it.
+- **In PAPER**, the same price is recorded — so the journal measures **signal quality**, not tap-reaction speed.
+
+If you tap a button 5 minutes late and the option has moved ₹30, the journal still uses the original alert price. The position monitor uses real-time LTP for SL / target / timeout decisions, so the trade is still evaluated against current market — but the entry P&L is anchored to the price the bot recommended.
+
+### Configurable exit levels (in `config.py`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SL_PCT` | `0.30` | Exit when premium drops 30% below entry |
+| `TARGET_PCT` | `0.50` | Exit when premium rises 50% above entry |
+| `SQUARE_OFF_HOUR` | `15` | Hard square-off hour (IST) |
+| `SQUARE_OFF_MINUTE` | `15` | Hard square-off minute. 15:15 = 15 min before close |
+| `POSITION_POLL_SECONDS` | `60` | How often to poll the option for exit conditions |
 
 ---
 
@@ -201,6 +244,53 @@ Empty output = clean.
 
 ---
 
+## Daily P&L review (V3)
+
+Every paper / live trade is journaled to `trades.db` (a SQLite file in `~/nifty-orb-alerts/`). One row per position with entry, exit, and P&L.
+
+### Quick review with `report.py`
+
+```bash
+cd ~/nifty-orb-alerts && source venv/bin/activate
+python3 report.py                              # today
+python3 report.py 2026-05-08                   # specific date
+python3 report.py 2026-05-08 --mode PAPER      # filter by mode
+```
+
+Output is a per-trade table plus daily totals (wins / losses / win rate / net P&L).
+
+### Correcting a row (rare)
+
+Back up first, then UPDATE. `pnl` is **stored**, not computed on read — always recompute it whenever you change `entry_price` or `exit_price`, or the row will be inconsistent:
+
+```bash
+cp trades.db trades.db.bak.$(date +%Y%m%d-%H%M)
+
+sqlite3 trades.db "
+BEGIN;
+UPDATE trades
+SET entry_price = <NEW_ENTRY>,
+    pnl         = (exit_price - <NEW_ENTRY>) * qty
+WHERE id = <ID>;
+COMMIT;
+"
+```
+
+### Reconstructing a trade from `orb.log`
+
+V3 writes structured, timestamped logs for every signal evaluation, fire, fill, position poll, and exit. After a trading day you can fully reconstruct any trade:
+
+```bash
+grep SIGNAL_FIRED orb.log         # all signals that fired today
+grep "EXIT reason" orb.log        # all exits with realized P&L
+grep position_tick orb.log        # minute-by-minute monitoring while holding
+grep "tick candle" orb.log        # every 5-min signal evaluation (including skips)
+```
+
+Useful when a trade behaved unexpectedly — you'll see the exact ORB levels, volume ratio, VWAP, and signal decision for each candle.
+
+---
+
 ## Tuning the filters
 
 All thresholds live in `config.py` on the Lightsail box. Edit, save, restart.
@@ -218,6 +308,7 @@ All thresholds live in `config.py` on the Lightsail box. Edit, save, restart.
 | `MAX_PREMIUM` | `500` | Skip auto-order if option premium > this | Catches expensive far-from-spot options |
 | `ORDER_PRODUCT` | `"MIS"` | MIS = intraday auto-squareoff | Use `"NRML"` only if carrying overnight |
 | `DRY_RUN` | `True` | Log instead of placing real orders | Flip to `False` after one clean DRY_RUN day |
+| `PAPER_TRADE` | `True` | Simulate fills + auto-exits + journal to `trades.db` (no real orders) | Flip to `False` once 2 weeks of paper history look profitable |
 
 **After editing `config.py`:**
 ```bash
@@ -344,9 +435,10 @@ If you're not comfortable with systemd, **stick with `nohup`** — it works fine
 |---|---|---|
 | **V1** | Done | Telegram alerts only |
 | **V1.5** | Done | Re-arm logic — up to 2 fires per direction |
-| **V2** | **Live now** | 5-min tracking; ITM-1 strike; 1-tap LIMIT order with safety guards; DRY_RUN flag |
-| **V3** | Planned | Auto stop-loss + target placement; trailing SL; multi-symbol (BankNifty, FinNifty) |
-| **V4** | Maybe | Holiday calendar, web dashboard, position dashboard with live P&L |
+| **V2** | Done | 5-min tracking; ITM-1 strike; 1-tap LIMIT order with safety guards; DRY_RUN flag |
+| **V3** | **Live now** | PAPER_TRADE mode; auto SL/target/timeout exits; `trades.db` journal at alert-time price; structured `orb.log`; `report.py` daily summary |
+| **V4** | Planned | Trailing SL; multi-symbol (BankNifty, FinNifty); holiday calendar |
+| **V5** | Maybe | Web dashboard with live P&L and per-trade breakdown |
 
 ---
 

@@ -419,24 +419,11 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
 
     answer_callback(cb_id, "Placing order...")
 
-    # PAPER mode: re-fetch the quote so the simulated fill price reflects the
-    # market AT button-tap time, not at alert time (the user may tap minutes later).
-    if config.PAPER_TRADE:
-        try:
-            q = kite.quote([f"NFO:{symbol}"])[f"NFO:{symbol}"]
-        except Exception as e:
-            send_alert(f"PAPER buy failed: quote fetch error: {e}")
-            return
-        _, ask = extract_bid_ask(q)
-        ltp = q.get("last_price")
-        fill_price = ask if ask and ask > 0 else ltp
-        if fill_price is None or fill_price <= 0:
-            send_alert(f"PAPER buy failed: no usable price for {symbol}")
-            return
-    else:
-        # LIVE / DRY_RUN: record the LIMIT we send. Real fills usually land at
-        # or slightly below this — close enough for journaling.
-        fill_price = price
+    # All modes journal at the alert-time LIMIT price. LIVE sends this price
+    # to Kite; PAPER matches so the journal measures signal quality rather
+    # than the user's tap-reaction delay (which won't exist once an automated
+    # broker leg places the order on tap).
+    fill_price = price
 
     _, err = place_buy_limit(kite, symbol, qty, price)
     if err:
