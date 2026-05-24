@@ -1,0 +1,4 @@
+# Dependencies for the LOCAL (Mac) MCP trade-journal server only.
+# NOT needed on the VM — keep these out of requirements.txt.
+# Install into a dedicated venv:  python3 -m venv .venv-mcp && .venv-mcp/bin/pip install -r requirements-mcp.txt
+mcp>=1.2.0

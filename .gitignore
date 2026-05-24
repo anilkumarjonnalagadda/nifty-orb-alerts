@@ -3,4 +3,5 @@ access_token.json
 __pycache__/
 *.pyc
 venv/
+.venv-mcp/
 *.log
