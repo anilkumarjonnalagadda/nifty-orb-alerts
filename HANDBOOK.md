@@ -128,9 +128,9 @@ Refresh Kite access token before 9:15 IST.
 https://kite.zerodha.com/connect/login?api_key=XXX&v=3
 
 2. SSH to Lightsail and run:
-   cd ~/nifty-orb-alerts && source venv/bin/activate
-   python auth.py
-   nohup python orb_monitor.py > orb.log 2>&1 &
+   cd ~/nifty-orb-alerts
+   python3 auth.py
+   ./start.sh
 ```
 
 ### Steps to follow (~60 seconds)
@@ -139,17 +139,19 @@ https://kite.zerodha.com/connect/login?api_key=XXX&v=3
 2. After login, you land on a page that may look broken — that's fine. **Copy the full URL** from the browser address bar (it contains `request_token=...`).
 3. **SSH to Lightsail** from your laptop or AWS browser-based SSH:
    ```bash
-   ssh ubuntu@<lightsail-ip>
+   ssh orb-vm                  # or: ssh ubuntu@<lightsail-ip>
    cd ~/nifty-orb-alerts
-   source venv/bin/activate
-   python auth.py
+   python3 auth.py
    ```
 4. **Paste the URL** when prompted. You'll see `Access token saved for today.`
-5. **Start the monitor:**
+5. **Start the monitor** (this stops any old process and starts a fresh one):
    ```bash
-   nohup python orb_monitor.py > orb.log 2>&1 &
+   ./start.sh
    ```
-6. Within a minute, you should get a Telegram alert: `ORB monitor started (DRY_RUN)` or `(LIVE)`. If yes — you're done. **Close the SSH window. The bot keeps running.**
+   `start.sh` first checks today's token is cached, then restarts the bot. If the
+   token is missing it tells you to run `python3 auth.py` instead of failing
+   silently. To stop the bot any time: `./stop.sh`.
+6. Within a minute, you should get a Telegram alert: `ORB monitor started (PAPER)`. If yes — you're done. **Close the SSH window. The bot keeps running.**
 
 ### Why the bot keeps running after you close SSH
 
