@@ -90,6 +90,21 @@ def record_sell(conn, entry_id, exit_price, exit_reason, ts=None):
     return pnl
 
 
+def month_to_date_pnl(conn, mode, year_month):
+    """Sum realized P&L for closed trades in `mode` during `year_month`.
+
+    `year_month` is "YYYY-MM", matched against the first 7 chars of exit_ts.
+    Open trades (exit_ts NULL) are excluded — only realized P&L counts toward
+    the monthly loss limit. Returns 0.0 when there are no matching trades.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(pnl), 0) AS p FROM trades "
+        "WHERE mode = ? AND exit_ts IS NOT NULL AND substr(exit_ts, 1, 7) = ?",
+        (mode, year_month),
+    ).fetchone()
+    return row["p"]
+
+
 def get_open_position(conn):
     """Return the most recent open position as a dict, or None.
 

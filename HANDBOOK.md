@@ -82,6 +82,32 @@ If you tap a button 5 minutes late and the option has moved ₹30, the journal s
 | `SQUARE_OFF_HOUR` | `15` | Hard square-off hour (IST) |
 | `SQUARE_OFF_MINUTE` | `15` | Hard square-off minute. 15:15 = 15 min before close |
 | `POSITION_POLL_SECONDS` | `60` | How often to poll the option for exit conditions |
+| `RISK_PER_TRADE_INR` | `5000` | Max rupees risked per trade; pricier options get skipped (see below) |
+| `MAX_LOTS` | `1` | Hard ceiling on lots per trade — never sizes beyond one lot |
+| `MONTHLY_LOSS_LIMIT_INR` | `15000` | Month's realized loss cap; pauses new trades when hit |
+
+### Position sizing & the monthly loss limit (V4)
+
+Two guards now bound how much you can lose. Both are automatic — you don't tap anything extra.
+
+**1. Per-trade risk cap (`RISK_PER_TRADE_INR`, default ₹5,000).**
+Before showing a BUY button, the bot works out the worst case if the stop-loss hits:
+
+> one-lot risk = option premium × `SL_PCT` (0.30) × `LOT_SIZE` (65) = premium × 19.5
+
+- If that worst-case loss is **within ₹5,000**, you get the button for **one lot** (65).
+- If even one lot would risk **more than ₹5,000**, the trade is **skipped** — no button — and you'll see `1-lot risk ₹… > risk cap ₹5000`.
+- At ₹5,000 the cutoff is a premium of about **₹256**: cheaper options trade, pricier ones are skipped.
+
+Why one lot only? `MAX_LOTS = 1` is a hard ceiling so the cap can only ever *skip* a trade, never *scale you up* into a bigger position. This is deliberate downside protection. If you ever want the bot to take expensive trades too, raise `RISK_PER_TRADE_INR` — but understand that also raises how much you can lose on one trade.
+
+**2. Monthly loss limit (`MONTHLY_LOSS_LIMIT_INR`, default ₹15,000).**
+The bot adds up your **realized** (closed) P&L for the current calendar month. Once losses for the month reach ₹15,000, it **stops offering new trades for the rest of the month** — you'll see `monthly loss limit hit`. It resets on its own at the start of the next month.
+
+- Any position already open is **still managed** normally (stop-loss, target, square-off all run). The limit only blocks *new* entries.
+- During paper trading the limit counts paper P&L; once live, it counts live P&L.
+
+These two are your hard guardrails. Treat a skip or a pause as the system doing its job — the whole point is to make a single bad trade, or a bad month, impossible to turn into a disaster.
 
 ---
 
@@ -165,7 +191,7 @@ VWAP: 22669.85
 Spot Nifty: 22691.55
 ITM-1 CE: NIFTY24MAY22650CE
 Bid/Ask: 152.10/152.45
-LIMIT: ₹152.95
+LIMIT: ₹152.95 | Qty: 65 (risk ≤ ₹5000)
 
 [ BUY 65 CE @ ₹152.95 ]   ← tap to place order
 ```
@@ -199,6 +225,8 @@ You'll see this if the safety guards rejected the auto-order:
 - `spread 7.2% > 5%` — option spread too wide; place manually with a tight limit
 - `premium ₹620 > MAX_PREMIUM ₹500` — option too expensive (often deep ITM after a big move)
 - `quote fetch failed: ...` — Kite API hiccup; refresh and place manually
+- `1-lot risk ₹5640 > risk cap ₹5000` — one lot of this option would risk more than your per-trade cap (its premium is above ~₹256). This is **by design** — don't override it lightly (see "Position sizing" below)
+- `monthly loss limit hit (MTD ₹-15200, limit ₹15000)` — the month's realized loss reached the cap; **no new trades until next month**
 
 The alert still fires — you just don't get the button.
 

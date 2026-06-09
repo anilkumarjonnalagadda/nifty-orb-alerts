@@ -45,6 +45,9 @@ _cfg.SQUARE_OFF_HOUR = 15
 _cfg.SQUARE_OFF_MINUTE = 15
 _cfg.POSITION_POLL_SECONDS = 60
 _cfg.DB_PATH = ":memory:"
+_cfg.RISK_PER_TRADE_INR = 5000
+_cfg.MAX_LOTS = 1
+_cfg.MONTHLY_LOSS_LIMIT_INR = 15000
 sys.modules["config"] = _cfg
 sys.modules["kite_auth"] = MagicMock()
 sys.modules["telegram_alert"] = MagicMock()
@@ -60,6 +63,7 @@ from orb_monitor import (  # noqa: E402
     evaluate_signal,
     extract_bid_ask,
     itm_option,
+    position_size,
     round_to_tick,
     select_last_closed_candle,
     update_rearm_state,
@@ -833,3 +837,73 @@ class TestTradesDb:
         trades_db.record_sell(conn, eid_l, 180.0, "SL")
         rows = conn.execute("SELECT mode, pnl FROM trades ORDER BY id").fetchall()
         assert [r["mode"] for r in rows] == ["PAPER", "LIVE"]
+
+
+# ── V4: risk-based position sizing ─────────────────────────────────────────────
+
+class TestPositionSize:
+    # Defaults mirror config: SL_PCT=0.30, LOT_SIZE=65 → one lot risks entry*19.5.
+    SL, LOT, CAP = 0.30, 65, 5000
+
+    def test_one_lot_within_cap(self):
+        # premium 100 → risk/lot 1950 ≤ 5000 → one lot.
+        assert position_size(100, self.SL, self.LOT, self.CAP, 1) == 65
+
+    def test_skip_when_one_lot_exceeds_cap(self):
+        # premium 300 → risk/lot 5850 > 5000 → skip.
+        assert position_size(300, self.SL, self.LOT, self.CAP, 1) == 0
+
+    def test_flip_point_around_256(self):
+        # cap/(sl*lot) = 5000/19.5 = 256.41 → 256 trades, 257 skips.
+        assert position_size(256, self.SL, self.LOT, self.CAP, 1) == 65
+        assert position_size(257, self.SL, self.LOT, self.CAP, 1) == 0
+
+    def test_max_lots_ceiling_of_one(self):
+        # premium 20 → risk/lot 390 → cap allows 12 lots, but max_lots=1.
+        assert position_size(20, self.SL, self.LOT, self.CAP, 1) == 65
+
+    def test_max_lots_allows_scaling_when_raised(self):
+        # same cheap premium, max_lots=3 → three lots.
+        assert position_size(20, self.SL, self.LOT, self.CAP, 3) == 195
+
+    def test_zero_or_negative_price_returns_zero(self):
+        assert position_size(0, self.SL, self.LOT, self.CAP, 1) == 0
+        assert position_size(-5, self.SL, self.LOT, self.CAP, 1) == 0
+
+
+# ── V4: month-to-date P&L for the monthly loss limit ──────────────────────────
+
+class TestMonthToDatePnl:
+
+    def _conn(self):
+        return trades_db.init_db(":memory:")
+
+    def _closed(self, conn, mode, entry, exit_, buy_ts, sell_ts):
+        eid = trades_db.record_buy(conn, "SYM", 65, entry, "UP", mode, ts=buy_ts)
+        trades_db.record_sell(conn, eid, exit_, "SL", ts=sell_ts)
+
+    def test_sums_closed_trades_in_month_and_mode(self):
+        conn = self._conn()
+        # (70-100)*65 = -1950 ; (80-100)*65 = -1300
+        self._closed(conn, "PAPER", 100, 70, "2026-06-01T10:00:00+05:30", "2026-06-01T11:00:00+05:30")
+        self._closed(conn, "PAPER", 100, 80, "2026-06-02T10:00:00+05:30", "2026-06-02T11:00:00+05:30")
+        assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == -3250
+
+    def test_excludes_other_month(self):
+        conn = self._conn()
+        self._closed(conn, "PAPER", 100, 70, "2026-05-01T10:00:00+05:30", "2026-05-30T11:00:00+05:30")
+        assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == 0
+
+    def test_excludes_other_mode(self):
+        conn = self._conn()
+        self._closed(conn, "LIVE", 100, 70, "2026-06-01T10:00:00+05:30", "2026-06-01T11:00:00+05:30")
+        assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == 0
+
+    def test_excludes_open_position(self):
+        conn = self._conn()
+        trades_db.record_buy(conn, "SYM", 65, 100, "UP", "PAPER", ts="2026-06-01T10:00:00+05:30")
+        assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == 0
+
+    def test_no_trades_returns_zero(self):
+        conn = self._conn()
+        assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == 0

@@ -86,3 +86,26 @@ POSITION_POLL_SECONDS = 60
 # process restart so today's open position can be recovered if you bounce
 # the bot mid-day.
 DB_PATH = "trades.db"
+
+# ── Risk sizing + monthly loss limit (V4) ────────────────────────────────────
+
+# Max rupees to risk on a single trade. Position size is chosen so the
+# worst-case loss if the stop hits (entry * SL_PCT * qty) stays within this.
+# NSE trades whole lots, so the smallest position is one LOT_SIZE lot. With
+# LOT_SIZE=65 and SL_PCT=0.30 one lot risks entry*19.5, so a signal whose
+# option premium exceeds RISK_PER_TRADE_INR / (SL_PCT * LOT_SIZE) is skipped
+# entirely (no BUY button) because even one lot would breach the cap. At 5000
+# the skip threshold is a premium of ~₹256.
+RISK_PER_TRADE_INR = 5000
+
+# Hard ceiling on lots per trade, on top of the risk cap. 1 = never size beyond
+# a single lot (pure downside protection — the cap can only skip a trade, never
+# scale it up). Raise only when you deliberately want multi-lot scaling.
+MAX_LOTS = 1
+
+# Month-to-date realized-loss limit (rupees). Once closed-trade P&L for the
+# current calendar month in the active mode (PAPER or LIVE) reaches
+# -MONTHLY_LOSS_LIMIT_INR, the bot stops offering NEW entries for the rest of
+# the month. Open positions are still managed (SL/target/square-off). Resets
+# automatically at the month boundary.
+MONTHLY_LOSS_LIMIT_INR = 15000

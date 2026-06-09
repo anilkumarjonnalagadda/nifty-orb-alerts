@@ -215,6 +215,24 @@ def extract_bid_ask(quote):
     return bid, ask
 
 
+# ── Risk-based position sizing (V4) ──────────────────────────────────────────
+
+def position_size(entry_price, sl_pct, lot_size, risk_per_trade_inr, max_lots):
+    """Return the order qty (a whole multiple of lot_size) whose worst-case
+    loss — entry_price * sl_pct * qty when the stop hits — stays within
+    risk_per_trade_inr, capped at max_lots lots.
+
+    Returns 0 when even a single lot would risk more than the cap; the caller
+    must then skip the auto-order, since one lot is the smallest tradable size.
+    """
+    risk_per_lot = entry_price * sl_pct * lot_size
+    if risk_per_lot <= 0:
+        return 0
+    lots = int(risk_per_trade_inr // risk_per_lot)
+    lots = min(lots, max_lots)
+    return lots * lot_size
+
+
 # ── Exit decision (V3) ───────────────────────────────────────────────────────
 
 def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target_pct):
@@ -417,6 +435,23 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
         send_alert(f"Skipping {symbol}: another position is already open.")
         return
 
+    # Monthly loss limit — authoritative gate. Blocks new entries (even from a
+    # stale button) once month-to-date realized loss in the active mode reaches
+    # the cap. Open positions are unaffected; they keep being managed.
+    journal_mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+    with db_lock:
+        mtd_pnl = trades_db.month_to_date_pnl(
+            conn, journal_mode, now_ist().strftime("%Y-%m")
+        )
+    if mtd_pnl <= -config.MONTHLY_LOSS_LIMIT_INR:
+        answer_callback(cb_id, "Monthly loss limit reached. Order blocked.")
+        send_alert(
+            f"BLOCKED {symbol}: monthly loss limit hit "
+            f"(MTD ₹{mtd_pnl:+.0f}, limit ₹{config.MONTHLY_LOSS_LIMIT_INR}).\n"
+            f"No new trades until next month."
+        )
+        return
+
     answer_callback(cb_id, "Placing order...")
 
     # All modes journal at the alert-time LIMIT price. LIVE sends this price
@@ -539,6 +574,8 @@ def main():
         f"Symbol: {fut_symbol}\n"
         f"Tracking: 5-min closes after 9:30\n"
         f"Lot: {config.LOT_SIZE}, Product: {config.ORDER_PRODUCT}\n"
+        f"Risk/trade: ≤₹{config.RISK_PER_TRADE_INR} (max {config.MAX_LOTS} lot) | "
+        f"Monthly stop: ₹{config.MONTHLY_LOSS_LIMIT_INR}\n"
         f"SL {int(config.SL_PCT*100)}% / Target {int(config.TARGET_PCT*100)}% / "
         f"Square-off {config.SQUARE_OFF_HOUR:02d}:{config.SQUARE_OFF_MINUTE:02d}\n"
         f"Waiting for ORB candle to close at 9:30 IST..."
@@ -732,16 +769,44 @@ def main():
         )
 
         if limit_price is not None:
-            payload = encode_order_callback(opt_symbol, limit_price, config.LOT_SIZE)
-            if config.PAPER_TRADE:
-                mode_tag = " [PAPER]"
-            elif config.DRY_RUN:
-                mode_tag = " [DRY_RUN]"
+            qty = position_size(
+                limit_price, config.SL_PCT, config.LOT_SIZE,
+                config.RISK_PER_TRADE_INR, config.MAX_LOTS,
+            )
+            journal_mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+            with db_lock:
+                mtd_pnl = trades_db.month_to_date_pnl(
+                    conn, journal_mode, now.strftime("%Y-%m")
+                )
+            limit_breached = mtd_pnl <= -config.MONTHLY_LOSS_LIMIT_INR
+
+            if limit_breached:
+                send_alert(
+                    body + f"\nAuto-order skipped: monthly loss limit hit "
+                    f"(MTD ₹{mtd_pnl:+.0f}, limit ₹{config.MONTHLY_LOSS_LIMIT_INR}).\n"
+                    f"Trading paused until next month."
+                )
+            elif qty == 0:
+                one_lot_risk = limit_price * config.SL_PCT * config.LOT_SIZE
+                send_alert(
+                    body + f"\nAuto-order skipped: 1-lot risk ₹{one_lot_risk:.0f} "
+                    f"> risk cap ₹{config.RISK_PER_TRADE_INR}.\nPlace manually if intended."
+                )
             else:
-                mode_tag = ""
-            label = f"BUY {config.LOT_SIZE} {buy_side} @ ₹{limit_price}{mode_tag}"
-            markup = build_order_button(label, payload)
-            send_alert(body + f"\nLIMIT: ₹{limit_price}", reply_markup=markup)
+                payload = encode_order_callback(opt_symbol, limit_price, qty)
+                if config.PAPER_TRADE:
+                    mode_tag = " [PAPER]"
+                elif config.DRY_RUN:
+                    mode_tag = " [DRY_RUN]"
+                else:
+                    mode_tag = ""
+                label = f"BUY {qty} {buy_side} @ ₹{limit_price}{mode_tag}"
+                markup = build_order_button(label, payload)
+                send_alert(
+                    body + f"\nLIMIT: ₹{limit_price} | Qty: {qty} "
+                    f"(risk ≤ ₹{config.RISK_PER_TRADE_INR})",
+                    reply_markup=markup,
+                )
         else:
             send_alert(body + f"\nAuto-order skipped: {reject_reason}\nPlace manually.")
 
