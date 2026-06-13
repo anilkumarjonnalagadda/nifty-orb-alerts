@@ -1,4 +1,4 @@
-# Nifty ORB Alert System — Handbook (V3)
+# Nifty ORB Alert System — Handbook (V5)
 
 Your daily operating manual for the breakout alert + 1-tap order bot running on AWS Lightsail.
 
@@ -6,17 +6,81 @@ Your daily operating manual for the breakout alert + 1-tap order bot running on 
 
 ## What this system does
 
-Every trading day, this bot watches the **Nifty current-month futures contract** on Zerodha and tells you (via Telegram) when price makes a clean breakout from the **first 15-minute range** of the day. When a signal fires, the alert comes with a **tappable BUY button** that places an ITM-1 option order at a marketable LIMIT price — one tap, one lot, done.
+Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (stop-loss, target, or end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
 
-- **ORB window:** 9:15–9:30 IST. The high and low of that 15-min candle become your levels.
-- **Watch period:** 9:30 AM – 3:30 PM IST. Every **5 minutes** (V2 — was 3 min in V1), the latest candle close is checked.
-- **Trigger:** A 5-min close above ORB high → buy **ITM-1 CE** (one strike below spot, ~0.65 delta). A close below ORB low → buy **ITM-1 PE** (one strike above spot).
-- **Filters (to cut noise):**
-  - Volume on the breakout candle must be > **1.2×** the average of the last 20 five-minute candles.
-  - Close must be on the right side of intraday VWAP (above for UP, below for DOWN).
-- **Re-fires:** Up to **2 alerts per direction per day**. After fire #1, price must pull back into the ORB by ≥ 15 pts before the system re-arms.
-- **One-tap order:** Each breakout alert includes an inline button: `BUY 65 CE @ ₹152.95`. Tap it → bot places a LIMIT order via Kite. You still manage stop-loss and exits manually.
-- **Safety guards:** auto-order is **skipped** (with a "place manually" note) when option spread > 5%, premium > ₹500, or quote depth is missing.
+**Who does what:**
+- **You do:** the morning Kite login, and one button tap for each trade you choose to take.
+- **The bot does:** watches the market, applies every filter, sizes the trade, places the order, and manages all exits automatically.
+- **Built-in protection:** per-trade risk capped at ~**₹5,000** (1 lot), and a **₹15,000 monthly loss limit** that pauses new trades for the rest of the month if hit.
+
+---
+
+## How the system decides (the full pipeline)
+
+A BUY recommendation appears **only when every check below is YES**. Each one is a noise filter — a single NO means no alert.
+
+```flowchart
+start|9:30 AM — ORB forms: record the day's High & Low
+process|Every 5 min, take the candle that just closed
+gate|Opened INSIDE the range? (don't chase a runaway move)
+gate|Closed beyond ORB High +10 / ORB Low -10?
+gate|Volume > 1.2x the 20-candle average?
+gate|Right side of VWAP? (above for UP, below for DOWN)
+gate|Still armed? (max 2 fires per direction per day)
+process|SIGNAL — pick ITM-1 option (CE for UP, PE for DOWN)
+gate|Spread <=5% and premium <=Rs.500?
+gate|1-lot stop-loss risk <=Rs.5000? (premium <=~Rs.256)
+gate|Month's loss still under Rs.15000?
+process|Tag HIGH CONVICTION if it also cleared the value area (VAH/VAL)
+end|Telegram alert with BUY button — nothing is bought until you tap
+```
+
+**The same filters in words:**
+1. **ORB formed** — the 9:15–9:30 candle sets the day's High and Low.
+2. **Open-inside-range** — the breakout candle must *open inside* the ORB (no chasing a move that already ran away).
+3. **Clean break** — close must clear ORB High **+10 pts** (UP) or ORB Low **−10 pts** (DOWN).
+4. **Volume** — breakout volume > **1.2×** the 20-candle average.
+5. **VWAP** — close above VWAP for UP, below for DOWN.
+6. **Armed / fire limit** — max **2 fires per direction** per day; after a fire, price must pull back ≥15 pts into the range to re-arm.
+7. **Option + liquidity guard** — pick ITM-1; skip the button if spread >5% or premium >₹500.
+8. **Risk sizing** — take 1 lot only if its worst-case stop-loss is ≤ **₹5,000** (premium ≲ ₹256); otherwise skip.
+9. **Monthly loss limit** — if the month's realized loss has hit **₹15,000**, pause until next month.
+10. **Conviction tag** — if the breakout also cleared the day's value area, the alert is marked **★ HIGH CONVICTION** (information only — still 1 lot).
+
+### After you tap: the bot runs the trade by itself
+
+```flowchart
+start|You tap BUY -> order placed & fill-confirmed (1 lot)
+process|Bot checks the live position every 60 seconds (automatic)
+gate|Premium up +50%? -> EXIT: TARGET
+gate|Premium down -30%? -> EXIT: STOP-LOSS
+gate|Clock reached 15:15? -> EXIT: square-off
+end|Auto-sell, fill-confirmed, P&L logged, EXIT alert sent
+```
+
+You do **not** tap to exit — exits are automatic. In live mode, both entry and exit are **fill-confirmed**: if a BUY doesn't fill because price jumped, you get "BUY NOT FILLED" and **no position is taken**.
+
+---
+
+## Every day: your 4 steps
+
+This is the entire daily routine — about a minute.
+
+1. **~8:30 AM** — you get a Telegram nudge with the Kite login link.
+2. **Log in to Kite** (Zerodha + 2FA) and copy the redirect URL from the browser.
+3. **Cache today's token** on the VM:
+   ```bash
+   ssh orb-vm
+   cd ~/nifty-orb-alerts
+   python3 auth.py        # paste the URL when prompted
+   ```
+4. **Start the bot:**
+   ```bash
+   ./start.sh
+   ```
+   You'll get an "ORB monitor started" message on Telegram. **Done — close SSH; the bot keeps running.**
+
+**During the day:** when a breakout alert arrives, **tap BUY** if you want that trade, or ignore it. The bot handles the stop-loss, target, and 15:15 square-off automatically. To stop the bot early: `./stop.sh`.
 
 ---
 

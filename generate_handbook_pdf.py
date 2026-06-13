@@ -20,7 +20,7 @@ class HandbookPDF(FPDF):
     def header(self):
         self.set_font("Arial", "B", 9)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 8, "ORB Monitor - Operator Handbook V3", align="R")
+        self.cell(0, 8, "ORB Monitor - Operator Handbook V5", align="R")
         self.ln(2)
         self.set_draw_color(200, 200, 200)
         self.line(10, self.get_y(), 200, self.get_y())
@@ -40,17 +40,17 @@ class HandbookPDF(FPDF):
         self.cell(0, 14, "Nifty ORB Alert System", align="C", ln=1)
         self.set_x(10)
         self.set_font("Arial", "B", 16)
-        self.cell(0, 10, "Operator Handbook - V3", align="C", ln=1)
+        self.cell(0, 10, "Operator Handbook - V5", align="C", ln=1)
         self.ln(8)
         self.set_x(10)
         self.set_font("Arial", "", 12)
         self.set_text_color(80, 80, 80)
-        self.cell(0, 7, "Paper trading  |  Auto SL/Target/Timeout  |  Trade journal", align="C", ln=1)
+        self.cell(0, 7, "Risk-sized 1-lot  |  Auto exits  |  Fill-confirmed  |  Conviction tag", align="C", ln=1)
         self.ln(20)
         self.set_x(10)
         self.set_font("Arial", "", 10)
         self.set_text_color(150, 150, 150)
-        self.cell(0, 8, "May 2026", align="C", ln=1)
+        self.cell(0, 8, "June 2026", align="C", ln=1)
         self.add_page()
 
     def _reset_x(self):
@@ -129,6 +129,53 @@ class HandbookPDF(FPDF):
         self.ln(2)
         self._reset_x()
 
+    def flowchart(self, steps):
+        """Draw a vertical flow of labelled boxes joined by arrows.
+
+        `steps` is a list of (kind, text); kind in start/process/gate/end and
+        sets the box colour. Used for the decision-pipeline diagrams.
+        """
+        colors = {
+            "start": (30, 80, 160),
+            "process": (70, 110, 170),
+            "gate": (200, 140, 30),
+            "end": (40, 140, 70),
+        }
+        box_w = 160
+        x = (210 - box_w) / 2
+        self.ln(2)
+        for idx, (kind, text) in enumerate(steps):
+            text = self._asciify(text)
+            lines = self._wrap_lines(text, box_w - 8)
+            h = 6 * len(lines) + 4
+            y = self.get_y()
+            if y + h + 10 > 272:
+                self.add_page()
+                y = self.get_y()
+            r, g, b = colors.get(kind, (70, 110, 170))
+            self.set_fill_color(r, g, b)
+            self.set_draw_color(r, g, b)
+            self.rect(x, y, box_w, h, "DF")
+            self.set_xy(x + 4, y + 2)
+            self.set_text_color(255, 255, 255)
+            self.set_font("Arial", "B", 9)
+            for ln_ in lines:
+                self.set_x(x + 4)
+                self.cell(box_w - 8, 6, ln_, ln=1)
+            if idx < len(steps) - 1:
+                cx = x + box_w / 2
+                self.set_draw_color(120, 120, 120)
+                self.set_line_width(0.5)
+                self.line(cx, y + h, cx, y + h + 6)
+                self.line(cx, y + h + 6, cx - 1.6, y + h + 3.5)
+                self.line(cx, y + h + 6, cx + 1.6, y + h + 3.5)
+                self.set_line_width(0.2)
+                self.set_y(y + h + 6)
+            else:
+                self.set_y(y + h)
+        self.ln(4)
+        self._reset_x()
+
     def table(self, headers, rows, col_widths):
         self.ln(2)
         self.set_fill_color(30, 80, 160)
@@ -185,6 +232,8 @@ class HandbookPDF(FPDF):
         text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
         # Arial Unicode on macOS lacks the rupee glyph; substitute "Rs."
         text = text.replace("₹", "Rs.")
+        # Strip emoji/variation-selectors the base font can't render.
+        text = text.replace("⚠️", "(!)").replace("⚠", "(!)").replace("️", "")
         return text
 
 
@@ -223,13 +272,14 @@ def parse_markdown(md_path):
             continue
 
         if stripped.startswith("```"):
+            lang = stripped[3:].strip().lower()
             i += 1
             buf = []
             while i < len(lines) and not lines[i].strip().startswith("```"):
                 buf.append(lines[i])
                 i += 1
             i += 1
-            yield ("code", "\n".join(buf))
+            yield (("flowchart" if lang == "flowchart" else "code"), "\n".join(buf))
             continue
 
         if stripped.startswith("|") and i + 1 < len(lines) and lines[i + 1].lstrip().startswith("|---"):
@@ -288,6 +338,18 @@ def build():
             pdf.bullet(pdf.render_inline(payload))
         elif kind == "code":
             pdf.code_block(payload)
+        elif kind == "flowchart":
+            steps = []
+            for line in payload.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if "|" in line:
+                    k, t = line.split("|", 1)
+                    steps.append((k.strip(), t.strip()))
+                else:
+                    steps.append(("process", line))
+            pdf.flowchart(steps)
         elif kind == "table":
             headers, rows = payload
             n = len(headers)
