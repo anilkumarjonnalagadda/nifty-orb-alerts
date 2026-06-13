@@ -2,6 +2,7 @@ import logging
 import sys
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime
 
 import pytz
@@ -233,6 +234,94 @@ def position_size(entry_price, sl_pct, lot_size, risk_per_trade_inr, max_lots):
     return lots * lot_size
 
 
+# ── Volume profile / high-conviction tag (V5) ────────────────────────────────
+
+def volume_profile(candles, bin_width, value_area_pct):
+    """Developing volume-at-price profile from OHLCV candles.
+
+    Each candle's volume is spread uniformly across its high-low range into
+    `bin_width`-point bins (a standard proxy — OHLCV doesn't reveal the
+    intra-candle distribution). Returns (poc, vah, val): the most-traded price
+    and the high/low edges of the `value_area_pct` (e.g. 0.70) volume band
+    around it. Returns None if there is no volume.
+    """
+    bins = defaultdict(float)
+    for c in candles:
+        hi, lo, vol = c["high"], c["low"], c["volume"]
+        if vol <= 0:
+            continue
+        lo_b = int(lo // bin_width)
+        hi_b = int(hi // bin_width)
+        share = vol / (hi_b - lo_b + 1)
+        for b in range(lo_b, hi_b + 1):
+            bins[b] += share
+    if not bins:
+        return None
+    total = sum(bins.values())
+    poc_b = max(bins, key=bins.get)
+    included = {poc_b}
+    acc = bins[poc_b]
+    lo_b = hi_b = poc_b
+    sorted_b = sorted(bins)
+    min_b, max_b = sorted_b[0], sorted_b[-1]
+    while acc < value_area_pct * total and (lo_b > min_b or hi_b < max_b):
+        up = bins.get(hi_b + 1, -1.0) if hi_b < max_b else -1.0
+        dn = bins.get(lo_b - 1, -1.0) if lo_b > min_b else -1.0
+        if up >= dn:
+            hi_b += 1
+            acc += bins.get(hi_b, 0.0)
+            included.add(hi_b)
+        else:
+            lo_b -= 1
+            acc += bins.get(lo_b, 0.0)
+            included.add(lo_b)
+    poc = (poc_b + 0.5) * bin_width
+    vah = (max(included) + 1) * bin_width
+    val = min(included) * bin_width
+    return poc, vah, val
+
+
+# ── Fill confirmation (V5 — for LIVE orders) ─────────────────────────────────
+
+def classify_fill(filled_qty, want_qty):
+    """Classify an order's fill: 'NONE' (nothing filled), 'PARTIAL' (some but
+    not all), or 'COMPLETE' (fully filled)."""
+    if filled_qty <= 0:
+        return "NONE"
+    if filled_qty < want_qty:
+        return "PARTIAL"
+    return "COMPLETE"
+
+
+def confirm_order_fill(kite, order_id, want_qty, timeout_s, poll_s):
+    """Poll Kite order history until the order is COMPLETE/terminal or timeout.
+
+    Returns (filled_qty, avg_price, status) where status comes from
+    classify_fill. I/O wrapper — not unit-tested (the offline suite covers
+    classify_fill instead).
+    """
+    deadline = time.time() + timeout_s
+    filled, avg = 0, 0.0
+    while time.time() < deadline:
+        try:
+            hist = kite.order_history(order_id)
+        except Exception as e:
+            logger.error("order_history failed for %s: %s", order_id, e)
+            time.sleep(poll_s)
+            continue
+        if hist:
+            last = hist[-1]
+            status = (last.get("status") or "").upper()
+            filled = last.get("filled_quantity") or 0
+            avg = last.get("average_price") or 0.0
+            if status == "COMPLETE":
+                return filled, avg, "COMPLETE"
+            if status in ("REJECTED", "CANCELLED"):
+                return filled, avg, classify_fill(filled, want_qty)
+        time.sleep(poll_s)
+    return filled, avg, classify_fill(filled, want_qty)
+
+
 # ── Exit decision (V3) ───────────────────────────────────────────────────────
 
 def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target_pct):
@@ -338,6 +427,25 @@ class PositionTracker:
             self._position = None
 
 
+class SignalContext:
+    """Thread-safe holder for the most recent signal's volume-profile context,
+    keyed by option symbol. The main thread sets it when it sends an alert; the
+    callback thread reads it when the BUY button is tapped, so the journal can
+    record the VAH/VAL/conviction that the alert was based on."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_symbol = {}
+
+    def set(self, symbol, ctx):
+        with self._lock:
+            self._by_symbol[symbol] = dict(ctx)
+
+    def get(self, symbol):
+        with self._lock:
+            return dict(self._by_symbol.get(symbol, {}))
+
+
 def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_time):
     """One tick of position monitoring. Closes the position in DB + tracker
     and sends a Telegram alert if SL/TARGET/TIMEOUT fires. Returns the exit
@@ -373,13 +481,41 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     # Live mode: SELL LIMIT slightly below best_bid to ensure fill on exit.
     sell_price = round_to_tick(max(0.05, raw_exit - config.LIMIT_BUFFER))
 
-    _, err = place_sell_limit(kite, symbol, position["qty"], sell_price)
+    order_id, err = place_sell_limit(kite, symbol, position["qty"], sell_price)
     if err:
         send_alert(f"SELL ORDER FAILED for {symbol}: {err}\nWill retry next tick.")
         return None
 
-    # PAPER records the realistic best_bid sim; LIVE records the LIMIT we sent.
-    recorded_exit = raw_exit if config.PAPER_TRADE else sell_price
+    if config.PAPER_TRADE:
+        # PAPER simulates a fill at the realistic best_bid reference.
+        recorded_exit = raw_exit
+    else:
+        # LIVE: confirm the exit actually filled before closing the position.
+        fill_qty, avg_price, status = confirm_order_fill(
+            kite, order_id, position["qty"],
+            config.FILL_CONFIRM_TIMEOUT_SECONDS, config.FILL_POLL_SECONDS,
+        )
+        if status == "NONE":
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception as e:
+                logger.error("cancel of unfilled SELL %s failed: %s", order_id, e)
+            send_alert(
+                f"SELL NOT FILLED for {symbol} [{reason}] @ ₹{sell_price:.2f}.\n"
+                f"Position still OPEN — retrying next tick."
+            )
+            logger.info("SELL not filled symbol=%s reason=%s — position kept open", symbol, reason)
+            return None
+        if status == "PARTIAL":
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception as e:
+                logger.error("cancel of SELL remainder %s failed: %s", order_id, e)
+            send_alert(
+                f"⚠️ EXIT PARTIAL for {symbol}: sold {fill_qty}/{position['qty']} @ ₹{avg_price:.2f}. "
+                f"{position['qty'] - fill_qty} left — broker auto-square-off will close it; VERIFY in Kite."
+            )
+        recorded_exit = avg_price
 
     with db_lock:
         pnl = trades_db.record_sell(conn, position["id"], recorded_exit, reason)
@@ -421,7 +557,7 @@ def decode_order_callback(payload):
         return None
 
 
-def handle_callback(kite, callback_query, conn, db_lock, tracker):
+def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
     cb_id = callback_query["id"]
     data = callback_query.get("data", "")
     decoded = decode_order_callback(data)
@@ -454,13 +590,7 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
 
     answer_callback(cb_id, "Placing order...")
 
-    # All modes journal at the alert-time LIMIT price. LIVE sends this price
-    # to Kite; PAPER matches so the journal measures signal quality rather
-    # than the user's tap-reaction delay (which won't exist once an automated
-    # broker leg places the order on tap).
-    fill_price = price
-
-    _, err = place_buy_limit(kite, symbol, qty, price)
+    order_id, err = place_buy_limit(kite, symbol, qty, price)
     if err:
         logger.error("BUY order failed: symbol=%s qty=%d price=%.2f err=%s", symbol, qty, price, err)
         send_alert(f"ORDER FAILED for {symbol}: {err}")
@@ -471,32 +601,71 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker):
         send_alert(f"[DRY_RUN] Order placed: {symbol} BUY {qty} @ LIMIT ₹{price}")
         return
 
-    # PAPER or LIVE: journal the buy and arm position monitoring.
+    # Determine the actual fill. PAPER simulates a full fill at the alert-time
+    # limit; LIVE confirms with the broker, because placing != filling — a
+    # marketable limit can rest unfilled if price jumped before the tap.
+    if config.PAPER_TRADE:
+        fill_qty, fill_price = qty, price
+    else:
+        fill_qty, avg_price, status = confirm_order_fill(
+            kite, order_id, qty,
+            config.FILL_CONFIRM_TIMEOUT_SECONDS, config.FILL_POLL_SECONDS,
+        )
+        if status == "NONE":
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception as e:
+                logger.error("cancel of unfilled BUY %s failed: %s", order_id, e)
+            logger.info("BUY not filled order=%s symbol=%s qty=%d limit=%.2f", order_id, symbol, qty, price)
+            send_alert(
+                f"BUY NOT FILLED: {symbol} @ ₹{price} (price likely moved past the limit).\n"
+                f"No position taken."
+            )
+            return
+        if status == "PARTIAL":
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception as e:
+                logger.error("cancel of BUY remainder %s failed: %s", order_id, e)
+            send_alert(
+                f"⚠️ PARTIAL FILL: {symbol} {fill_qty}/{qty} @ ₹{avg_price:.2f}.\n"
+                f"Holding {fill_qty} (odd lot — exit may need manual handling in Kite)."
+            )
+        fill_price = avg_price
+
+    # Journal the buy (with the signal's volume-profile context) and arm monitoring.
     signal_type = "UP" if symbol.endswith("CE") else "DOWN"
     mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+    ctx = signal_ctx.get(symbol)
     with db_lock:
-        entry_id = trades_db.record_buy(conn, symbol, qty, fill_price, signal_type, mode)
+        entry_id = trades_db.record_buy(
+            conn, symbol, fill_qty, fill_price, signal_type, mode,
+            vah=ctx.get("vah"), val=ctx.get("val"), poc=ctx.get("poc"),
+            conviction=ctx.get("conviction"),
+        )
     tracker.open({
-        "id": entry_id, "symbol": symbol, "qty": qty,
+        "id": entry_id, "symbol": symbol, "qty": fill_qty,
         "entry_price": fill_price, "signal_type": signal_type, "mode": mode,
     })
     logger.info(
-        "BUY filled mode=%s symbol=%s qty=%d entry=%.2f signal=%s sl=%.2f target=%.2f",
-        mode, symbol, qty, fill_price, signal_type,
+        "BUY filled mode=%s symbol=%s qty=%d entry=%.2f signal=%s conviction=%s sl=%.2f target=%.2f",
+        mode, symbol, fill_qty, fill_price, signal_type, ctx.get("conviction"),
         fill_price * (1 - config.SL_PCT), fill_price * (1 + config.TARGET_PCT),
     )
 
     mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
+    conv = ctx.get("conviction")
+    conv_line = f"\nConviction: {conv}" if conv and conv != "n/a" else ""
     send_alert(
         f"{mode_tag}BUY filled: {symbol}\n"
-        f"Entry: ₹{fill_price:.2f} ({qty} qty)\n"
+        f"Entry: ₹{fill_price:.2f} ({fill_qty} qty){conv_line}\n"
         f"SL: -{int(config.SL_PCT*100)}% @ ₹{fill_price * (1 - config.SL_PCT):.2f}\n"
         f"Target: +{int(config.TARGET_PCT*100)}% @ ₹{fill_price * (1 + config.TARGET_PCT):.2f}\n"
         f"Square-off: {config.SQUARE_OFF_HOUR:02d}:{config.SQUARE_OFF_MINUTE:02d} IST"
     )
 
 
-def callback_listener(kite, stop_event, conn, db_lock, tracker):
+def callback_listener(kite, stop_event, conn, db_lock, tracker, signal_ctx):
     """Background thread: long-poll Telegram for button taps and place orders."""
     offset = None
     while not stop_event.is_set():
@@ -506,7 +675,7 @@ def callback_listener(kite, stop_event, conn, db_lock, tracker):
             cq = u.get("callback_query")
             if cq:
                 try:
-                    handle_callback(kite, cq, conn, db_lock, tracker)
+                    handle_callback(kite, cq, conn, db_lock, tracker, signal_ctx)
                 except Exception as e:
                     logger.exception("Callback handler error: %s", e)
         if not updates:
@@ -538,6 +707,7 @@ def main():
     conn = trades_db.init_db()
     db_lock = threading.Lock()
     tracker = PositionTracker()
+    signal_ctx = SignalContext()
 
     # Mid-day restart recovery: if a row is open in the DB, resume monitoring.
     recovered = trades_db.get_open_position(conn)
@@ -552,7 +722,7 @@ def main():
     stop_event = threading.Event()
     listener = threading.Thread(
         target=callback_listener,
-        args=(kite, stop_event, conn, db_lock, tracker),
+        args=(kite, stop_event, conn, db_lock, tracker, signal_ctx),
         daemon=True,
     )
     listener.start()
@@ -750,6 +920,24 @@ def main():
         ref_level = orb_high if signal == "UP" else orb_low
         sign = "+" if signal == "UP" else "-"
 
+        # Developing volume profile (V5) — used only to TAG conviction, never to
+        # gate. UP is high-conviction when the breakout close clears VAH; DOWN
+        # when it clears VAL. Built from the day's 1-min futures candles.
+        vp = (volume_profile(candles_1m, config.VP_BIN_WIDTH, config.VP_VALUE_AREA_PCT)
+              if candles_1m and len(candles_1m) >= config.VP_WARMUP_MINUTES else None)
+        if vp:
+            poc_v, vah_v, val_v = vp
+            high_conv = (close > vah_v) if signal == "UP" else (close < val_v)
+            conviction = "HIGH" if high_conv else "normal"
+            edge = f"VAH {vah_v:.0f}" if signal == "UP" else f"VAL {val_v:.0f}"
+            conv_desc = (f"★ HIGH CONVICTION — cleared {edge}" if high_conv
+                         else f"normal — inside value ({edge})")
+            va_line = f"VA: POC {poc_v:.0f} / VAH {vah_v:.0f} / VAL {val_v:.0f}\n{conv_desc}"
+        else:
+            poc_v = vah_v = val_v = None
+            conviction = "n/a"
+            va_line = "VA: n/a (warmup)"
+
         body = (
             f"{label_dir} — fire {fires_now}/{max_fires}\n"
             f"{fut_symbol} 5m close: {close} {comparator} ORB {'High' if signal=='UP' else 'Low'} "
@@ -757,15 +945,16 @@ def main():
             f"Vol: {last['volume']} (avg {avg_vol:.0f}, x{vol_ratio:.2f})\n"
             f"VWAP: {vwap_str}\n"
             f"Spot Nifty: {spot}\n"
+            f"{va_line}\n"
             f"ITM-1 {buy_side}: {opt_symbol}\n"
             f"Bid/Ask: {bid_ask}"
         )
 
         logger.info(
             "SIGNAL_FIRED dir=%s fire=%d/%d close=%.2f ref=%.2f spot=%.2f "
-            "opt=%s bid=%s ask=%s limit=%s reject=%s",
+            "opt=%s bid=%s ask=%s limit=%s conviction=%s vah=%s val=%s reject=%s",
             signal, fires_now, max_fires, close, ref_level, spot,
-            opt_symbol, bid, ask, limit_price, reject_reason or "none",
+            opt_symbol, bid, ask, limit_price, conviction, vah_v, val_v, reject_reason or "none",
         )
 
         if limit_price is not None:
@@ -793,6 +982,9 @@ def main():
                     f"> risk cap ₹{config.RISK_PER_TRADE_INR}.\nPlace manually if intended."
                 )
             else:
+                signal_ctx.set(opt_symbol, {
+                    "vah": vah_v, "val": val_v, "poc": poc_v, "conviction": conviction,
+                })
                 payload = encode_order_callback(opt_symbol, limit_price, qty)
                 if config.PAPER_TRADE:
                     mode_tag = " [PAPER]"
@@ -800,7 +992,8 @@ def main():
                     mode_tag = " [DRY_RUN]"
                 else:
                     mode_tag = ""
-                label = f"BUY {qty} {buy_side} @ ₹{limit_price}{mode_tag}"
+                conv_tag = "★ " if conviction == "HIGH" else ""
+                label = f"{conv_tag}BUY {qty} {buy_side} @ ₹{limit_price}{mode_tag}"
                 markup = build_order_button(label, payload)
                 send_alert(
                     body + f"\nLIMIT: ₹{limit_price} | Qty: {qty} "

@@ -48,6 +48,11 @@ _cfg.DB_PATH = ":memory:"
 _cfg.RISK_PER_TRADE_INR = 5000
 _cfg.MAX_LOTS = 1
 _cfg.MONTHLY_LOSS_LIMIT_INR = 15000
+_cfg.FILL_CONFIRM_TIMEOUT_SECONDS = 8
+_cfg.FILL_POLL_SECONDS = 1
+_cfg.VP_BIN_WIDTH = 5.0
+_cfg.VP_VALUE_AREA_PCT = 0.70
+_cfg.VP_WARMUP_MINUTES = 60
 sys.modules["config"] = _cfg
 sys.modules["kite_auth"] = MagicMock()
 sys.modules["telegram_alert"] = MagicMock()
@@ -61,10 +66,12 @@ from orb_monitor import (  # noqa: E402
     decode_order_callback,
     encode_order_callback,
     evaluate_signal,
+    classify_fill,
     extract_bid_ask,
     itm_option,
     position_size,
     round_to_tick,
+    volume_profile,
     select_last_closed_candle,
     update_rearm_state,
 )
@@ -907,3 +914,78 @@ class TestMonthToDatePnl:
     def test_no_trades_returns_zero(self):
         conn = self._conn()
         assert trades_db.month_to_date_pnl(conn, "PAPER", "2026-06") == 0
+
+
+# ── V5: volume profile (high-conviction tag) ──────────────────────────────────
+
+class TestVolumeProfile:
+    def _c(self, hi, lo, vol):
+        return {"high": hi, "low": lo, "volume": vol}
+
+    def test_none_when_no_volume(self):
+        assert volume_profile([], 5.0, 0.70) is None
+        assert volume_profile([self._c(100, 90, 0)], 5.0, 0.70) is None
+
+    def test_poc_at_heaviest_bin(self):
+        # Heavy volume in the 100-105 bin, light far above.
+        candles = [self._c(104, 100, 1000), self._c(124, 120, 50)]
+        poc, vah, val = volume_profile(candles, 5.0, 0.70)
+        assert 100 <= poc <= 105
+        assert val <= poc <= vah
+
+    def test_value_area_widens_with_pct(self):
+        candles = [self._c(104, 100, 500), self._c(109, 105, 300), self._c(114, 110, 200)]
+        _, vah70, val70 = volume_profile(candles, 5.0, 0.70)
+        _, vah100, val100 = volume_profile(candles, 5.0, 1.0)
+        assert (vah100 - val100) >= (vah70 - val70)
+
+    def test_conviction_direction(self):
+        # Value area built low; an UP close above VAH = high-conviction,
+        # a DOWN close below VAL = high-conviction.
+        candles = [self._c(104, 100, 1000)]
+        poc, vah, val = volume_profile(candles, 5.0, 0.70)
+        assert (110 > vah)        # UP breakout above value -> would clear VAH
+        assert (95 < val)         # DOWN breakdown below value -> would clear VAL
+
+
+# ── V5: fill classification ───────────────────────────────────────────────────
+
+class TestClassifyFill:
+    def test_none(self):
+        assert classify_fill(0, 65) == "NONE"
+
+    def test_partial(self):
+        assert classify_fill(40, 65) == "PARTIAL"
+
+    def test_complete(self):
+        assert classify_fill(65, 65) == "COMPLETE"
+
+    def test_over_counts_complete(self):
+        assert classify_fill(130, 65) == "COMPLETE"
+
+
+# ── V5: trade journal records volume-profile context ──────────────────────────
+
+class TestJournalConviction:
+    def test_record_buy_stores_va_context(self):
+        conn = trades_db.init_db(":memory:")
+        eid = trades_db.record_buy(
+            conn, "NIFTY26JUN23400CE", 65, 185.95, "UP", "LIVE",
+            vah=23475.0, val=23385.0, poc=23432.5, conviction="HIGH",
+        )
+        row = conn.execute(
+            "SELECT vah, val, poc, conviction FROM trades WHERE id=?", (eid,)
+        ).fetchone()
+        assert row["vah"] == 23475.0
+        assert row["val"] == 23385.0
+        assert row["poc"] == 23432.5
+        assert row["conviction"] == "HIGH"
+
+    def test_record_buy_defaults_va_to_null(self):
+        conn = trades_db.init_db(":memory:")
+        eid = trades_db.record_buy(conn, "SYM", 65, 100.0, "UP", "PAPER")
+        row = conn.execute(
+            "SELECT vah, conviction FROM trades WHERE id=?", (eid,)
+        ).fetchone()
+        assert row["vah"] is None
+        assert row["conviction"] is None

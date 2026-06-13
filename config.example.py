@@ -109,3 +109,22 @@ MAX_LOTS = 1
 # the month. Open positions are still managed (SL/target/square-off). Resets
 # automatically at the month boundary.
 MONTHLY_LOSS_LIMIT_INR = 15000
+
+# ── Fill confirmation (V5 — for LIVE) ────────────────────────────────────────
+# After placing a LIVE order, poll its status for up to this many seconds to
+# confirm it actually FILLED — placing an order is not the same as it filling.
+# Prevents the bot from acting on a phantom position when a marketable LIMIT
+# doesn't fill because price jumped past it before the order reached the book.
+# Only used in LIVE mode (PAPER simulates a fill at the limit).
+FILL_CONFIRM_TIMEOUT_SECONDS = 8
+FILL_POLL_SECONDS = 1
+
+# ── Volume-profile high-conviction tag (V5) ──────────────────────────────────
+# Developing volume profile, built from the day's 1-min futures candles up to
+# the signal, is used ONLY to LABEL a signal high-conviction — it never blocks
+# a trade. UP is high-conviction when the breakout close clears the value-area
+# high (VAH); DOWN when it clears the value-area low (VAL). VAH/VAL/POC and the
+# conviction are journaled for later analysis.
+VP_BIN_WIDTH = 5.0          # price-bin size (points) for the histogram
+VP_VALUE_AREA_PCT = 0.70    # standard 70% value area
+VP_WARMUP_MINUTES = 60      # skip the VA tag until this many 1-min candles exist

@@ -29,9 +29,17 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_price    REAL,
     exit_ts       TEXT,
     exit_reason   TEXT,
-    pnl           REAL
+    pnl           REAL,
+    vah           REAL,
+    val           REAL,
+    poc           REAL,
+    conviction    TEXT
 );
 """
+
+# Columns added after the original schema shipped. Existing trades.db files
+# (created before V5) are migrated in init_db via ALTER TABLE.
+_ADDED_COLUMNS = (("vah", "REAL"), ("val", "REAL"), ("poc", "REAL"), ("conviction", "TEXT"))
 
 
 def _connect(path=None):
@@ -48,9 +56,14 @@ def _connect(path=None):
 
 
 def init_db(path=None):
-    """Create the trades table if missing. Idempotent. Returns the connection."""
+    """Create the trades table if missing and migrate older files. Idempotent.
+    Returns the connection."""
     conn = _connect(path)
     conn.execute(_SCHEMA)
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    for col, typ in _ADDED_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
     conn.commit()
     return conn
 
@@ -59,12 +72,18 @@ def _now_iso():
     return datetime.now(IST).isoformat(timespec="seconds")
 
 
-def record_buy(conn, symbol, qty, entry_price, signal_type, mode, ts=None):
-    """Insert a new open position. Returns the row id (use to close later)."""
+def record_buy(conn, symbol, qty, entry_price, signal_type, mode, ts=None,
+               vah=None, val=None, poc=None, conviction=None):
+    """Insert a new open position. Returns the row id (use to close later).
+
+    vah/val/poc/conviction capture the developing volume-profile context at
+    signal time (V5) for later analysis — they never affect trade logic.
+    """
     cur = conn.execute(
-        "INSERT INTO trades (symbol, qty, signal_type, mode, entry_price, entry_ts) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (symbol, int(qty), signal_type, mode, float(entry_price), ts or _now_iso()),
+        "INSERT INTO trades (symbol, qty, signal_type, mode, entry_price, entry_ts, "
+        "vah, val, poc, conviction) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (symbol, int(qty), signal_type, mode, float(entry_price), ts or _now_iso(),
+         vah, val, poc, conviction),
     )
     conn.commit()
     return cur.lastrowid

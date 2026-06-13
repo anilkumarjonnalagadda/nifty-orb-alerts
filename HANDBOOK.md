@@ -232,6 +232,17 @@ You'll see this if the safety guards rejected the auto-order:
 
 The alert still fires — you just don't get the button.
 
+### "★ HIGH CONVICTION" tag (V5)
+Some signals carry a `★ HIGH CONVICTION` tag on the button and a `VA: POC.. / VAH.. / VAL..` line in the alert. This means the breakout cleared the day's **value area** (where most volume traded) — historically a higher-quality setup. A signal without the star is `normal — inside value`.
+
+**Important:** this is *information only*. Both kinds still fire and both still place **one lot** if you tap. The star does **not** mean "trade bigger" — size is always 1 lot. We're collecting data to learn whether high-conviction signals actually win more.
+
+### Live fill messages (V5 — only in LIVE mode)
+In LIVE mode the bot confirms your order actually filled before acting. You may see:
+- **"BUY NOT FILLED"** — price moved past your limit before the order filled, so **no position was taken**. Nothing to do; wait for the next signal. (This is a safety feature, not an error.)
+- **"⚠️ PARTIAL FILL"** — only part of the lot filled (rare). The message tells you how many; check Kite.
+- **"SELL NOT FILLED … retrying"** — an exit didn't fill on the first try; the bot keeps trying. The broker's auto-square-off (~3:20 PM) is the final backstop.
+
 ### "Market closed. ORB monitor stopping."
 End of day at 3:30 PM. Shows total fires.
 
