@@ -6,7 +6,7 @@ Your daily operating manual for the breakout alert + 1-tap order bot running on 
 
 ## What this system does
 
-Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (stop-loss, target, or end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
+Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (a −30% stop that *trails up* to lock gains as the trade rises — "let winners run" — or the end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
 
 **Who does what:**
 - **You do:** the morning Kite login, and one button tap for each trade you choose to take.
@@ -52,8 +52,9 @@ end|Telegram alert with BUY button — nothing is bought until you tap
 ```flowchart
 start|You tap BUY -> order placed & fill-confirmed (1 lot)
 process|Bot checks the live position every 60 seconds (automatic)
-gate|Premium up +50%? -> EXIT: TARGET
-gate|Premium down -30%? -> EXIT: STOP-LOSS
+process|As premium rises, the stop trails UP behind it (locks gains)
+gate|Premium fell to the trailing stop? -> EXIT: TRAIL (win or loss)
+gate|Premium down -30% from entry (initial stop)? -> EXIT: STOP-LOSS
 gate|Clock reached 15:15? -> EXIT: square-off
 end|Auto-sell, fill-confirmed, P&L logged, EXIT alert sent
 ```
@@ -114,7 +115,7 @@ Before flipping `DRY_RUN = False` (which uses real money), run **`PAPER_TRADE = 
 - When you tap the button, **no Kite order is placed** — but the bot:
   1. Journals the trade in `trades.db` at the **alert-time LIMIT price** (same value LIVE will use).
   2. Starts monitoring the position every minute (`POSITION_POLL_SECONDS = 60`).
-  3. Auto-exits on **SL** (premium drops 30%), **TARGET** (premium rises 50%), or **TIMEOUT** (15:15 IST square-off).
+  3. Auto-exits on the **trailing stop** (initial −30%, then trails up to lock gains; exit reason `TRAIL`) or **TIMEOUT** (15:15 IST square-off). *(With `USE_TRAILING_STOP=False` it reverts to the old fixed −30% SL / +50% TARGET.)*
   4. Sends a Telegram exit alert with realized P&L.
 
 This builds a full P&L history without risking capital. Mode truth table:
@@ -141,8 +142,9 @@ If you tap a button 5 minutes late and the option has moved ₹30, the journal s
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `SL_PCT` | `0.30` | Exit when premium drops 30% below entry |
-| `TARGET_PCT` | `0.50` | Exit when premium rises 50% above entry |
+| `SL_PCT` | `0.30` | Initial stop 30% below entry; also the trailing give-back distance |
+| `USE_TRAILING_STOP` | `True` | Trailing stop, no fixed target ("let winners run"). False = old fixed SL/target |
+| `TARGET_PCT` | `0.50` | Fixed target — **ignored when `USE_TRAILING_STOP=True`** |
 | `SQUARE_OFF_HOUR` | `15` | Hard square-off hour (IST) |
 | `SQUARE_OFF_MINUTE` | `15` | Hard square-off minute. 15:15 = 15 min before close |
 | `POSITION_POLL_SECONDS` | `60` | How often to poll the option for exit conditions |

@@ -324,16 +324,30 @@ def confirm_order_fill(kite, order_id, want_qty, timeout_s, poll_s):
 
 # ── Exit decision (V3) ───────────────────────────────────────────────────────
 
-def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target_pct):
-    """Return 'SL', 'TARGET', 'TIMEOUT', or None.
+def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target_pct,
+                peak_price=None, use_trailing=False):
+    """Return an exit reason ('SL' / 'TARGET' / 'TRAIL' / 'TIMEOUT') or None.
 
-    SL/TARGET use current_price as a fraction of entry_price. TIMEOUT fires
-    when wall-clock now has reached the configured square-off time, regardless
-    of P&L. SL takes precedence over TARGET when both somehow fire on the same
-    tick (defensive — shouldn't happen with normal levels).
+    TIMEOUT always fires once wall-clock `now` reaches the square-off time.
+
+    Fixed mode (use_trailing=False): SL at entry*(1-sl_pct), TARGET at
+    entry*(1+target_pct). SL wins ties (defensive).
+
+    Trailing mode (use_trailing=True, the V6 'let winners run' upgrade): no
+    fixed target. The stop starts at entry*(1-sl_pct) and trails up to stay
+    sl_pct*entry below the running peak (`peak_price`), locking in gains as the
+    option rises — it never moves down. Returns 'TRAIL' when that stop is hit
+    (which may be a win or a loss; the P&L tells which).
     """
     if now >= square_off_time:
         return "TIMEOUT"
+    if use_trailing:
+        if peak_price is None:
+            peak_price = entry_price
+        stop = peak_price - sl_pct * entry_price
+        if current_price <= stop:
+            return "TRAIL"
+        return None
     if current_price <= entry_price * (1 - sl_pct):
         return "SL"
     if current_price >= entry_price * (1 + target_pct):
@@ -422,6 +436,15 @@ class PositionTracker:
             self._position = dict(position)
             return True
 
+    def update_peak(self, price):
+        """Raise the open position's high-water mark (for the trailing stop).
+        Never lowers it. No-op if no position is open."""
+        with self._lock:
+            if self._position is not None:
+                cur = self._position.get("peak", self._position["entry_price"])
+                if price > cur:
+                    self._position["peak"] = price
+
     def close(self):
         with self._lock:
             self._position = None
@@ -464,14 +487,21 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
 
     bid, _ = extract_bid_ask(q)
 
+    # Trailing-stop high-water mark: peak = max(prior peak, current ltp).
+    entry = position["entry_price"]
+    prev_peak = position.get("peak", entry)
+    peak = ltp if ltp > prev_peak else prev_peak
+    tracker.update_peak(ltp)
+
     reason = decide_exit(
-        position["entry_price"], ltp, now_ist(), square_off_time,
+        entry, ltp, now_ist(), square_off_time,
         config.SL_PCT, config.TARGET_PCT,
+        peak_price=peak, use_trailing=config.USE_TRAILING_STOP,
     )
-    pnl_pct = (ltp - position["entry_price"]) / position["entry_price"] * 100
+    pnl_pct = (ltp - entry) / entry * 100
     logger.info(
-        "position_tick %s entry=%.2f ltp=%.2f bid=%s pnl=%+.2f%% decision=%s",
-        symbol, position["entry_price"], ltp, bid, pnl_pct, reason or "HOLD",
+        "position_tick %s entry=%.2f ltp=%.2f peak=%.2f bid=%s pnl=%+.2f%% decision=%s",
+        symbol, entry, ltp, peak, bid, pnl_pct, reason or "HOLD",
     )
     if reason is None:
         return None
@@ -646,21 +676,31 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
     tracker.open({
         "id": entry_id, "symbol": symbol, "qty": fill_qty,
         "entry_price": fill_price, "signal_type": signal_type, "mode": mode,
+        "peak": fill_price,
     })
     logger.info(
-        "BUY filled mode=%s symbol=%s qty=%d entry=%.2f signal=%s conviction=%s sl=%.2f target=%.2f",
+        "BUY filled mode=%s symbol=%s qty=%d entry=%.2f signal=%s conviction=%s sl=%.2f trailing=%s",
         mode, symbol, fill_qty, fill_price, signal_type, ctx.get("conviction"),
-        fill_price * (1 - config.SL_PCT), fill_price * (1 + config.TARGET_PCT),
+        fill_price * (1 - config.SL_PCT), config.USE_TRAILING_STOP,
     )
 
     mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
     conv = ctx.get("conviction")
     conv_line = f"\nConviction: {conv}" if conv and conv != "n/a" else ""
+    if config.USE_TRAILING_STOP:
+        exit_line = (
+            f"Initial SL: -{int(config.SL_PCT*100)}% @ ₹{fill_price * (1 - config.SL_PCT):.2f}\n"
+            f"Then trailing stop (locks gains as it rises; no fixed target)"
+        )
+    else:
+        exit_line = (
+            f"SL: -{int(config.SL_PCT*100)}% @ ₹{fill_price * (1 - config.SL_PCT):.2f}\n"
+            f"Target: +{int(config.TARGET_PCT*100)}% @ ₹{fill_price * (1 + config.TARGET_PCT):.2f}"
+        )
     send_alert(
         f"{mode_tag}BUY filled: {symbol}\n"
         f"Entry: ₹{fill_price:.2f} ({fill_qty} qty){conv_line}\n"
-        f"SL: -{int(config.SL_PCT*100)}% @ ₹{fill_price * (1 - config.SL_PCT):.2f}\n"
-        f"Target: +{int(config.TARGET_PCT*100)}% @ ₹{fill_price * (1 + config.TARGET_PCT):.2f}\n"
+        f"{exit_line}\n"
         f"Square-off: {config.SQUARE_OFF_HOUR:02d}:{config.SQUARE_OFF_MINUTE:02d} IST"
     )
 
@@ -712,11 +752,14 @@ def main():
     # Mid-day restart recovery: if a row is open in the DB, resume monitoring.
     recovered = trades_db.get_open_position(conn)
     if recovered is not None:
+        # Peak isn't persisted in the DB; restart the trailing high-water mark
+        # from entry (conservative — the trail re-arms from the entry stop).
+        recovered["peak"] = recovered["entry_price"]
         tracker.open(recovered)
         send_alert(
             f"Recovered open position: {recovered['symbol']} "
             f"(qty {recovered['qty']} @ ₹{recovered['entry_price']:.2f}, mode={recovered['mode']})\n"
-            f"Resuming SL/target monitoring."
+            f"Resuming exit monitoring."
         )
 
     stop_event = threading.Event()
@@ -746,8 +789,8 @@ def main():
         f"Lot: {config.LOT_SIZE}, Product: {config.ORDER_PRODUCT}\n"
         f"Risk/trade: ≤₹{config.RISK_PER_TRADE_INR} (max {config.MAX_LOTS} lot) | "
         f"Monthly stop: ₹{config.MONTHLY_LOSS_LIMIT_INR}\n"
-        f"SL {int(config.SL_PCT*100)}% / Target {int(config.TARGET_PCT*100)}% / "
-        f"Square-off {config.SQUARE_OFF_HOUR:02d}:{config.SQUARE_OFF_MINUTE:02d}\n"
+        f"Exit: {'SL ' + str(int(config.SL_PCT*100)) + '% + trailing (let winners run)' if config.USE_TRAILING_STOP else 'SL ' + str(int(config.SL_PCT*100)) + '% / Target ' + str(int(config.TARGET_PCT*100)) + '%'}"
+        f" / Square-off {config.SQUARE_OFF_HOUR:02d}:{config.SQUARE_OFF_MINUTE:02d}\n"
         f"Waiting for ORB candle to close at 9:30 IST..."
     )
 

@@ -41,6 +41,7 @@ _cfg.DRY_RUN = True
 _cfg.PAPER_TRADE = True
 _cfg.SL_PCT = 0.30
 _cfg.TARGET_PCT = 0.50
+_cfg.USE_TRAILING_STOP = True
 _cfg.SQUARE_OFF_HOUR = 15
 _cfg.SQUARE_OFF_MINUTE = 15
 _cfg.POSITION_POLL_SECONDS = 60
@@ -734,6 +735,44 @@ class TestDecideExit:
         now = ts(11, 0)
         result = decide_exit(self.ENTRY, 50.0, now, self._square_off(), 0.30, 0.50)
         assert result == "SL"
+
+    # ── V6: trailing-stop mode (use_trailing=True) ────────────────────────────
+
+    def _trail(self, current, peak, now=None):
+        return decide_exit(self.ENTRY, current, now or self._now(), self._square_off(),
+                           self.SL, self.TG, peak_price=peak, use_trailing=True)
+
+    def test_trail_initial_stop_at_minus_30(self):
+        # No rise yet (peak==entry): stop is entry-30% = 70.
+        assert self._trail(70.0, 100.0) == "TRAIL"
+        assert self._trail(70.01, 100.0) is None
+
+    def test_trail_no_fixed_target(self):
+        # +60% with no pullback from the peak must NOT exit (trailing has no target).
+        assert self._trail(160.0, 160.0) is None
+
+    def test_trail_locks_gain_after_rise(self):
+        # Peaked at 150, stop trails to 150-30 = 120.
+        assert self._trail(120.0, 150.0) == "TRAIL"   # exit locked at +20%
+        assert self._trail(121.0, 150.0) is None       # still holding
+
+    def test_trail_big_winner(self):
+        # Peaked at 200, stop = 170; exit at +70%.
+        assert self._trail(170.0, 200.0) == "TRAIL"
+        assert self._trail(171.0, 200.0) is None
+
+    def test_trail_new_high_does_not_exit(self):
+        # Current is the new high → stop is 30 below it → no exit.
+        assert self._trail(180.0, 180.0) is None
+
+    def test_trail_timeout_still_overrides(self):
+        now = ts(15, 15)
+        assert self._trail(190.0, 200.0, now=now) == "TIMEOUT"
+
+    def test_trail_defaults_peak_to_entry_when_none(self):
+        # peak_price omitted -> treated as entry; stop = 70.
+        assert decide_exit(self.ENTRY, 70.0, self._now(), self._square_off(),
+                           self.SL, self.TG, use_trailing=True) == "TRAIL"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

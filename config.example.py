@@ -68,7 +68,18 @@ PAPER_TRADE = True
 SL_PCT = 0.30
 
 # Target (profit-take) as a fraction of the entry premium. 0.50 = exit at +50%.
+# IGNORED when USE_TRAILING_STOP is True.
 TARGET_PCT = 0.50
+
+# Exit style (V6 — "let winners run", validated on 7yr backtest).
+#   True  = trailing stop, NO fixed target: the stop starts at -SL_PCT and
+#           trails up to stay SL_PCT*entry below the running peak, locking in
+#           gains as the option rises (never moves down). Captures big trend
+#           days the fixed +50% target used to cut off. Backtest: lifted CAGR
+#           ~8.5%->~10-12% and cut max drawdown ~37%->~28%.
+#   False = original fixed SL_PCT stop / TARGET_PCT target behaviour.
+# The trailing give-back distance equals SL_PCT (e.g. 30% of entry below peak).
+USE_TRAILING_STOP = True
 
 # Hard square-off time. Any open position is exited at this IST time even if
 # SL/TARGET have not hit. Set well before market close so MIS auto-squareoff
