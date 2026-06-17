@@ -39,6 +39,7 @@ _cfg.MAX_PREMIUM = 500
 _cfg.ORDER_PRODUCT = "MIS"
 _cfg.DRY_RUN = True
 _cfg.PAPER_TRADE = True
+_cfg.PAPER_AUTO_ENTER = False
 _cfg.SL_PCT = 0.30
 _cfg.TARGET_PCT = 0.50
 _cfg.USE_TRAILING_STOP = True
@@ -60,6 +61,8 @@ sys.modules["telegram_alert"] = MagicMock()
 
 from orb_monitor import (  # noqa: E402
     PositionTracker,
+    SignalContext,
+    enter_position,
     compute_limit_price,
     compute_vol_filter,
     compute_vwap,
@@ -1028,3 +1031,55 @@ class TestJournalConviction:
         ).fetchone()
         assert row["vah"] is None
         assert row["conviction"] is None
+
+
+# ── PAPER auto-enter (temporary Telegram-ban workaround) ──────────────────────
+
+class TestEnterPositionAutoEnter:
+    """With no button tap reachable (Telegram banned in India), enter_position
+    must journal the paper trade and arm the tracker directly (cb_id=None)."""
+
+    def test_paper_auto_enter_journals_and_arms(self):
+        import threading
+        conn = trades_db.init_db(":memory:")
+        tracker = PositionTracker()
+        ctx = SignalContext()
+        symbol = "NIFTY26JUN24000CE"
+        ctx.set(symbol, {"vah": 24010.0, "val": 23950.0, "poc": 23980.0,
+                         "conviction": "HIGH"})
+
+        enter_position(None, symbol, 120.0, 65, conn,
+                       threading.Lock(), tracker, ctx, cb_id=None)
+
+        # Position armed for monitoring at the alert-time price/qty.
+        assert tracker.is_open()
+        pos = tracker.current()
+        assert pos["symbol"] == symbol
+        assert pos["entry_price"] == 120.0
+        assert pos["qty"] == 65
+        assert pos["signal_type"] == "UP"
+        assert pos["mode"] == "PAPER"
+        # Journaled (still open) with the signal's VP context.
+        row = conn.execute(
+            "SELECT entry_price, mode, conviction, exit_ts FROM trades WHERE id=?",
+            (pos["id"],),
+        ).fetchone()
+        assert row["entry_price"] == 120.0
+        assert row["mode"] == "PAPER"
+        assert row["conviction"] == "HIGH"
+        assert row["exit_ts"] is None
+
+    def test_auto_enter_skips_when_position_already_open(self):
+        import threading
+        conn = trades_db.init_db(":memory:")
+        tracker = PositionTracker()
+        ctx = SignalContext()
+        tracker.open({"id": 1, "symbol": "X", "qty": 65, "entry_price": 50.0,
+                      "signal_type": "UP", "mode": "PAPER", "peak": 50.0})
+
+        enter_position(None, "NIFTY26JUN24000CE", 120.0, 65, conn,
+                       threading.Lock(), tracker, ctx, cb_id=None)
+
+        # At-most-one position: no new journal row, original position intact.
+        assert conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"] == 0
+        assert tracker.current()["id"] == 1

@@ -63,6 +63,14 @@ DRY_RUN = True
 #   False        False    LIVE      Yes          Yes  Yes
 PAPER_TRADE = True
 
+# TEMPORARY (Telegram banned in India through 2026-06-22 night): when True AND
+# PAPER_TRADE is True, a fired signal auto-journals the paper trade at the
+# alert-time LIMIT price WITHOUT waiting for the BUY-button tap. Needed because
+# the phone can't reach Telegram to tap during the ban. Set back to False once
+# Telegram is unblocked to restore the normal tap-to-enter workflow. Has NO
+# effect when PAPER_TRADE is False (LIVE/DRY always require the tap).
+PAPER_AUTO_ENTER = False
+
 # Stop-loss as a fraction of the entry premium. 0.30 = exit if option mid drops
 # 30% below entry (e.g. enter at ₹100, exit at ₹70).
 SL_PCT = 0.30

@@ -595,10 +595,20 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
         answer_callback(cb_id, "Invalid order payload")
         return
     symbol, price, qty = decoded  # `price` is the LIMIT from alert time
+    enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx, cb_id=cb_id)
 
+
+def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx, cb_id=None):
+    """Open one position, journal it with the signal's VP context, and arm exit
+    monitoring. Shared by the Telegram BUY-button tap (cb_id set) and the PAPER
+    auto-enter path (cb_id None — see PAPER_AUTO_ENTER). At-most-one open
+    position is enforced here, so both entry paths stay mutually exclusive."""
     if tracker.is_open():
-        answer_callback(cb_id, "Position already open. Skipping.")
-        send_alert(f"Skipping {symbol}: another position is already open.")
+        if cb_id:
+            answer_callback(cb_id, "Position already open. Skipping.")
+            send_alert(f"Skipping {symbol}: another position is already open.")
+        else:
+            logger.info("AUTO_ENTER skipped: position already open (%s)", symbol)
         return
 
     # Monthly loss limit — authoritative gate. Blocks new entries (even from a
@@ -610,7 +620,8 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
             conn, journal_mode, now_ist().strftime("%Y-%m")
         )
     if mtd_pnl <= -config.MONTHLY_LOSS_LIMIT_INR:
-        answer_callback(cb_id, "Monthly loss limit reached. Order blocked.")
+        if cb_id:
+            answer_callback(cb_id, "Monthly loss limit reached. Order blocked.")
         send_alert(
             f"BLOCKED {symbol}: monthly loss limit hit "
             f"(MTD ₹{mtd_pnl:+.0f}, limit ₹{config.MONTHLY_LOSS_LIMIT_INR}).\n"
@@ -618,7 +629,8 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
         )
         return
 
-    answer_callback(cb_id, "Placing order...")
+    if cb_id:
+        answer_callback(cb_id, "Placing order...")
 
     order_id, err = place_buy_limit(kite, symbol, qty, price)
     if err:
@@ -1028,21 +1040,35 @@ def main():
                 signal_ctx.set(opt_symbol, {
                     "vah": vah_v, "val": val_v, "poc": poc_v, "conviction": conviction,
                 })
-                payload = encode_order_callback(opt_symbol, limit_price, qty)
-                if config.PAPER_TRADE:
-                    mode_tag = " [PAPER]"
-                elif config.DRY_RUN:
-                    mode_tag = " [DRY_RUN]"
+                if config.PAPER_TRADE and getattr(config, "PAPER_AUTO_ENTER", False):
+                    # TEMPORARY (Telegram India ban): no tap reachable, so enter
+                    # the paper trade directly. The alert is still sent for the
+                    # record (no button — enter_position confirms the fill).
+                    send_alert(
+                        body + f"\nLIMIT: ₹{limit_price} | Qty: {qty} "
+                        f"(risk ≤ ₹{config.RISK_PER_TRADE_INR})\n"
+                        f"[AUTO-ENTER: paper trade taken automatically — Telegram ban]"
+                    )
+                    enter_position(
+                        kite, opt_symbol, limit_price, qty,
+                        conn, db_lock, tracker, signal_ctx,
+                    )
                 else:
-                    mode_tag = ""
-                conv_tag = "★ " if conviction == "HIGH" else ""
-                label = f"{conv_tag}BUY {qty} {buy_side} @ ₹{limit_price}{mode_tag}"
-                markup = build_order_button(label, payload)
-                send_alert(
-                    body + f"\nLIMIT: ₹{limit_price} | Qty: {qty} "
-                    f"(risk ≤ ₹{config.RISK_PER_TRADE_INR})",
-                    reply_markup=markup,
-                )
+                    payload = encode_order_callback(opt_symbol, limit_price, qty)
+                    if config.PAPER_TRADE:
+                        mode_tag = " [PAPER]"
+                    elif config.DRY_RUN:
+                        mode_tag = " [DRY_RUN]"
+                    else:
+                        mode_tag = ""
+                    conv_tag = "★ " if conviction == "HIGH" else ""
+                    label = f"{conv_tag}BUY {qty} {buy_side} @ ₹{limit_price}{mode_tag}"
+                    markup = build_order_button(label, payload)
+                    send_alert(
+                        body + f"\nLIMIT: ₹{limit_price} | Qty: {qty} "
+                        f"(risk ≤ ₹{config.RISK_PER_TRADE_INR})",
+                        reply_markup=markup,
+                    )
         else:
             send_alert(body + f"\nAuto-order skipped: {reject_reason}\nPlace manually.")
 
