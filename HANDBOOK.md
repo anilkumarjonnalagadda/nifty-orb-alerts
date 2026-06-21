@@ -1,4 +1,4 @@
-# Nifty ORB Alert System — Handbook (V5)
+# Nifty ORB Alert System — Handbook (V7)
 
 Your daily operating manual for the breakout alert + 1-tap order bot running on AWS Lightsail.
 
@@ -7,6 +7,8 @@ Your daily operating manual for the breakout alert + 1-tap order bot running on 
 ## What this system does
 
 Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (a −30% stop that *trails up* to lock gains as the trade rises — "let winners run" — or the end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
+
+**New in V7 — you only trade the last ~2 weeks of the monthly cycle.** The bot now picks the option *expiry* by how close the monthly expiry is: in the **last 15 days** before monthly expiry it offers an **actionable MONTHLY** call (the trades you take); earlier in the cycle it offers a **weekly** call tagged **TRACKING ONLY** — recorded as paper to measure performance, with no button and no real money. See "Which option you'll be offered" below.
 
 **Who does what:**
 - **You do:** the morning Kite login, and one button tap for each trade you choose to take.
@@ -42,7 +44,7 @@ end|Telegram alert with BUY button — nothing is bought until you tap
 4. **Volume** — breakout volume > **1.2×** the 20-candle average.
 5. **VWAP** — close above VWAP for UP, below for DOWN.
 6. **Armed / fire limit** — max **2 fires per direction** per day; after a fire, price must pull back ≥15 pts into the range to re-arm.
-7. **Option + liquidity guard** — pick ITM-1; skip the button if spread >5% or premium >₹500.
+7. **Expiry + option** — pick ITM-1 on the **monthly** (≤15 days to monthly expiry → actionable) or the **weekly** (earlier in the cycle → tracked only); skip the button if spread >5% or premium >₹500.
 8. **Risk sizing** — take 1 lot only if its worst-case stop-loss is ≤ **₹5,000** (premium ≲ ₹256); otherwise skip.
 9. **Monthly loss limit** — if the month's realized loss has hit **₹15,000**, pause until next month.
 10. **Conviction tag** — if the breakout also cleared the day's value area, the alert is marked **★ HIGH CONVICTION** (information only — still 1 lot).
@@ -60,6 +62,24 @@ end|Auto-sell, fill-confirmed, P&L logged, EXIT alert sent
 ```
 
 You do **not** tap to exit — exits are automatic. In live mode, both entry and exit are **fill-confirmed**: if a BUY doesn't fill because price jumped, you get "BUY NOT FILLED" and **no position is taken**.
+
+---
+
+## Which option you'll be offered: weekly (track) vs monthly (act)
+
+The bot chooses the option **expiry** from how many days are left to the **monthly** expiry — and **only the monthly half is yours to trade**.
+
+**Last ~2 weeks of the cycle → MONTHLY (you ACT).**
+When the monthly contract is **15 days or fewer** from expiry, the bot recommends the **monthly** ITM-1 call, tagged **ACTIONABLE** with a BUY button. These are the trades you take. This is the validated DTE-monthly strategy.
+
+**Earlier in the cycle → WEEKLY (TRACKING ONLY, you do nothing).**
+When the monthly is **more than 15 days** out, the bot recommends a **weekly** ITM-1 call but tags it **TRACKING ONLY** — **no button**, and it's recorded as a *paper* trade purely to measure how the weekly half performs. **These stay paper even after you go live — never real money.** You ignore them.
+
+Every alert tells you which half you're in:
+- `Expiry: MONTHLY · 4d to expiry — ACTIONABLE` → a real recommendation (trade it if you choose)
+- `Expiry: WEEKLY · monthly 22d out — TRACKING ONLY (no order)` → ignore; it's only being recorded
+
+**In one line:** in the ~2 weeks before each monthly expiry you get real monthly recommendations to act on; the rest of the month the bot quietly paper-tracks weeklies and you sit out. The switch is automatic — the cutoff is `DTE_MONTHLY_MAX` (default **15**) in `config.py`, and `WEEKLY_TRACK_ONLY=True` keeps the weekly half paper-only.
 
 ---
 
@@ -257,6 +277,7 @@ NIFTY24MAYFUT 5m close: 22693.10 > ORB High 22687.40 (+10 buf)
 Vol: 142500 (avg 89200, x1.60)
 VWAP: 22669.85
 Spot Nifty: 22691.55
+Expiry: MONTHLY · 4d to expiry — ACTIONABLE
 ITM-1 CE: NIFTY24MAY22650CE
 Bid/Ask: 152.10/152.45
 LIMIT: ₹152.95 | Qty: 65 (risk ≤ ₹5000)
@@ -266,6 +287,7 @@ LIMIT: ₹152.95 | Qty: 65 (risk ≤ ₹5000)
 
 - **fire 1/2** = first breakout in this direction today
 - **x1.60** = breakout candle volume was 1.6× the 20-candle avg — strong
+- **Expiry: MONTHLY … ACTIONABLE** = you're in the last ~2 weeks of the monthly cycle, so this is a real recommendation with a button. (A `WEEKLY … TRACKING ONLY` line means ignore it — see below.)
 - **ITM-1 CE** = 50 pts in the money (better delta than ATM for short holds)
 - **Bid/Ask** = the live option quote at the moment the alert fired
 - **LIMIT ₹152.95** = `best_ask + 0.50` rounded to 0.05 tick — almost guaranteed to fill at the visible ask
@@ -302,6 +324,16 @@ The alert still fires — you just don't get the button.
 Some signals carry a `★ HIGH CONVICTION` tag on the button and a `VA: POC.. / VAH.. / VAL..` line in the alert. This means the breakout cleared the day's **value area** (where most volume traded) — historically a higher-quality setup. A signal without the star is `normal — inside value`.
 
 **Important:** this is *information only*. Both kinds still fire and both still place **one lot** if you tap. The star does **not** mean "trade bigger" — size is always 1 lot. We're collecting data to learn whether high-conviction signals actually win more.
+
+### "TRACKING ONLY" (weekly, early in the cycle)
+Earlier in the monthly cycle (monthly more than 15 days out) you'll see alerts like:
+```
+Expiry: WEEKLY · monthly 22d out — TRACKING ONLY (no order)
+ITM-1 CE: NIFTY25JUN24650CE
+LIMIT: ₹138.00 | Qty: 65
+[TRACKING ONLY — weekly journaled as paper, not actionable]
+```
+There is **no button and nothing to do**. The bot records it as a *paper* trade so the weekly half's performance can be compared later. **These never use real money — not even in LIVE mode.** You act only on **ACTIONABLE** (monthly) alerts. This is normal for roughly the first two weeks after each monthly expiry.
 
 ### Live fill messages (V5 — only in LIVE mode)
 In LIVE mode the bot confirms your order actually filled before acting. You may see:
@@ -544,8 +576,12 @@ If you're not comfortable with systemd, **stick with `nohup`** — it works fine
 | **V1.5** | Done | Re-arm logic — up to 2 fires per direction |
 | **V2** | Done | 5-min tracking; ITM-1 strike; 1-tap LIMIT order with safety guards; DRY_RUN flag |
 | **V3** | **Live now** | PAPER_TRADE mode; auto SL/target/timeout exits; `trades.db` journal at alert-time price; structured `orb.log`; `report.py` daily summary |
-| **V4** | Planned | Trailing SL; multi-symbol (BankNifty, FinNifty); holiday calendar |
-| **V5** | Maybe | Web dashboard with live P&L and per-trade breakdown |
+| **V4** | Done | Risk-based position sizing; monthly loss limit |
+| **V5** | Done | Live fill-confirmation; VAH/VAL high-conviction tagging |
+| **V6** | Done | Trailing-stop exit ("let winners run"); `USE_TRAILING_STOP` flag |
+| **V7** | **Live (paper)** | DTE expiry routing: monthly ITM-1 (≤15 DTE, actionable) vs weekly (early cycle, paper-tracked) — `DTE_MONTHLY_MAX`, `WEEKLY_TRACK_ONLY`. Paper-validating before live flip |
+| **V7+** | Researching | Put-side support-OI confirmation filter — passed walk-forward backtest; paper-observe ~1 month before adoption |
+| **Later** | Maybe | Multi-symbol (BankNifty, FinNifty); holiday calendar; web dashboard with live P&L |
 
 ---
 

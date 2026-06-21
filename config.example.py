@@ -129,6 +129,22 @@ MAX_LOTS = 1
 # automatically at the month boundary.
 MONTHLY_LOSS_LIMIT_INR = 15000
 
+# ── DTE-based expiry routing (V7 — weekly-track / monthly-act) ────────────────
+# The bot picks the option expiry based on how many days are left until the
+# MONTHLY expiry (the current Nifty monthly futures expiry):
+#   monthly DTE <= DTE_MONTHLY_MAX  → recommend the MONTHLY ITM-1 (the validated
+#                                     DTE-monthly<=15 strategy; ACTIONABLE).
+#   monthly DTE >  DTE_MONTHLY_MAX  → recommend the WEEKLY ITM-1 (early cycle).
+# Backtest support: the DTE-monthly<=15 CE variant led the OOS (2024-26) option
+# family; weekly is kept early-cycle only to TRACK performance.
+DTE_MONTHLY_MAX = 15
+
+# When True, weekly (early-cycle) signals are journaled as PAPER for performance
+# tracking and get NO live BUY button — you act ONLY on the monthly (late-cycle)
+# recommendations. This holds even in LIVE mode: weekly stays paper-tracked,
+# monthly goes live. Set False to make weekly actionable too (not recommended).
+WEEKLY_TRACK_ONLY = True
+
 # ── Fill confirmation (V5 — for LIVE) ────────────────────────────────────────
 # After placing a LIVE order, poll its status for up to this many seconds to
 # confirm it actually FILLED — placing an order is not the same as it filling.

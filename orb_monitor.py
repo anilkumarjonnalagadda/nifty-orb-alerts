@@ -138,12 +138,17 @@ def next_5min_boundary():
 # ── Option selection (V2) ────────────────────────────────────────────────────
 
 
-def itm_option(spot, direction, instruments_nfo):
+def itm_option(spot, direction, instruments_nfo, target_expiry=None):
     """Return the ITM-1 option (one strike in the money) for the given direction.
 
     UP  → BUY CE; ITM means strike *below* spot.
     DOWN → BUY PE; ITM means strike *above* spot.
     Returns the full instrument dict (has tradingsymbol, instrument_token, etc.).
+
+    target_expiry (date) selects WHICH expiry:
+      None  → nearest expiry on/after today (the weekly). Default, unchanged.
+      date  → that exact expiry if it exists (the monthly), else the nearest
+              expiry on/after it, else the nearest overall.
     """
     today = now_ist().date()
     atm_strike = round(spot / 50) * 50
@@ -162,7 +167,41 @@ def itm_option(spot, direction, instruments_nfo):
         and i["expiry"] >= today
     ]
     opts.sort(key=lambda x: x["expiry"])
-    return opts[0] if opts else None
+    if not opts:
+        return None
+    if target_expiry is not None:
+        exact = [o for o in opts if o["expiry"] == target_expiry]
+        if exact:
+            return exact[0]
+        after = [o for o in opts if o["expiry"] >= target_expiry]
+        if after:
+            return after[0]
+    return opts[0]
+
+
+def days_to_expiry(expiry, today):
+    """Whole days from `today` (a date) to `expiry` (a date or datetime)."""
+    exp = expiry.date() if isinstance(expiry, datetime) else expiry
+    return (exp - today).days
+
+
+def select_trade_plan(monthly_dte, max_dte, weekly_track_only):
+    """Route a signal to weekly (early cycle) or monthly (late cycle) expiry.
+
+    monthly_dte       — days to the current monthly expiry.
+    max_dte           — at/below this, trade the MONTHLY (config.DTE_MONTHLY_MAX).
+    weekly_track_only — when in the weekly regime, journal as PAPER (track) with
+                        no live button instead of being actionable.
+
+    Returns a dict: {regime, use_monthly, track_only, actionable}.
+    Pure — no I/O, no config reads — so it is unit-testable in isolation.
+    """
+    if monthly_dte <= max_dte:
+        return {"regime": "monthly", "use_monthly": True,
+                "track_only": False, "actionable": True}
+    return {"regime": "weekly", "use_monthly": False,
+            "track_only": bool(weekly_track_only),
+            "actionable": not bool(weekly_track_only)}
 
 
 # ── Limit price calc (V2) ────────────────────────────────────────────────────
@@ -358,14 +397,18 @@ def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target
 # ── Order placement (V2) ─────────────────────────────────────────────────────
 
 
-def place_buy_limit(kite, tradingsymbol, qty, price):
+def place_buy_limit(kite, tradingsymbol, qty, price, paper=None):
     """Place a BUY LIMIT order on NFO. Returns (order_id, error).
 
     PAPER_TRADE wins over DRY_RUN — both skip the Kite call, but PAPER mode
     is wired up by the caller to also write to the trade journal and start
     SL/target monitoring.
+
+    `paper` overrides config.PAPER_TRADE for this one order (None = use config).
+    Used to paper-track weekly (early-cycle) signals even while the bot is LIVE.
     """
-    if config.PAPER_TRADE:
+    is_paper = config.PAPER_TRADE if paper is None else paper
+    if is_paper:
         return f"paper-{int(time.time())}", None
     if config.DRY_RUN:
         logger.info("DRY_RUN would BUY %s qty=%d @ LIMIT %.2f", tradingsymbol, qty, price)
@@ -387,9 +430,14 @@ def place_buy_limit(kite, tradingsymbol, qty, price):
         return None, str(e)
 
 
-def place_sell_limit(kite, tradingsymbol, qty, price):
-    """Place a SELL LIMIT order on NFO. Mirrors place_buy_limit for exits."""
-    if config.PAPER_TRADE:
+def place_sell_limit(kite, tradingsymbol, qty, price, paper=None):
+    """Place a SELL LIMIT order on NFO. Mirrors place_buy_limit for exits.
+
+    `paper` overrides config.PAPER_TRADE (None = use config) so a paper-tracked
+    position exits as paper even when the bot is otherwise LIVE.
+    """
+    is_paper = config.PAPER_TRADE if paper is None else paper
+    if is_paper:
         return f"paper-sell-{int(time.time())}", None
     if config.DRY_RUN:
         logger.info("DRY_RUN would SELL %s qty=%d @ LIMIT %.2f", tradingsymbol, qty, price)
@@ -475,6 +523,9 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     reason or None.
     """
     symbol = position["symbol"]
+    # Exit in the SAME mode the position was opened in (a weekly track is PAPER
+    # even when the bot is LIVE), not the global config flag.
+    is_paper = position.get("mode") == "PAPER"
     try:
         q = kite.quote([f"NFO:{symbol}"])[f"NFO:{symbol}"]
     except Exception as e:
@@ -511,12 +562,12 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     # Live mode: SELL LIMIT slightly below best_bid to ensure fill on exit.
     sell_price = round_to_tick(max(0.05, raw_exit - config.LIMIT_BUFFER))
 
-    order_id, err = place_sell_limit(kite, symbol, position["qty"], sell_price)
+    order_id, err = place_sell_limit(kite, symbol, position["qty"], sell_price, paper=is_paper)
     if err:
         send_alert(f"SELL ORDER FAILED for {symbol}: {err}\nWill retry next tick.")
         return None
 
-    if config.PAPER_TRADE:
+    if is_paper:
         # PAPER simulates a fill at the realistic best_bid reference.
         recorded_exit = raw_exit
     else:
@@ -554,10 +605,10 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
     logger.info(
         "EXIT reason=%s symbol=%s entry=%.2f exit=%.2f qty=%d pnl=%+.2f mode=%s",
         reason, symbol, position["entry_price"], recorded_exit, position["qty"],
-        pnl, "PAPER" if config.PAPER_TRADE else "LIVE",
+        pnl, "PAPER" if is_paper else "LIVE",
     )
 
-    mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
+    mode_tag = "[PAPER] " if is_paper else ""
     send_alert(
         f"{mode_tag}EXIT [{reason}] {symbol}\n"
         f"Entry: ₹{position['entry_price']:.2f} → Exit: ₹{recorded_exit:.2f}\n"
@@ -598,11 +649,15 @@ def handle_callback(kite, callback_query, conn, db_lock, tracker, signal_ctx):
     enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx, cb_id=cb_id)
 
 
-def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx, cb_id=None):
+def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx, cb_id=None, paper=None):
     """Open one position, journal it with the signal's VP context, and arm exit
     monitoring. Shared by the Telegram BUY-button tap (cb_id set) and the PAPER
     auto-enter path (cb_id None — see PAPER_AUTO_ENTER). At-most-one open
-    position is enforced here, so both entry paths stay mutually exclusive."""
+    position is enforced here, so both entry paths stay mutually exclusive.
+
+    `paper` overrides config.PAPER_TRADE for this entry (None = use config), so a
+    weekly (early-cycle) track is journaled/managed as PAPER even when LIVE."""
+    is_paper = config.PAPER_TRADE if paper is None else paper
     if tracker.is_open():
         if cb_id:
             answer_callback(cb_id, "Position already open. Skipping.")
@@ -614,7 +669,7 @@ def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx,
     # Monthly loss limit — authoritative gate. Blocks new entries (even from a
     # stale button) once month-to-date realized loss in the active mode reaches
     # the cap. Open positions are unaffected; they keep being managed.
-    journal_mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+    journal_mode = "PAPER" if is_paper else "LIVE"
     with db_lock:
         mtd_pnl = trades_db.month_to_date_pnl(
             conn, journal_mode, now_ist().strftime("%Y-%m")
@@ -632,21 +687,21 @@ def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx,
     if cb_id:
         answer_callback(cb_id, "Placing order...")
 
-    order_id, err = place_buy_limit(kite, symbol, qty, price)
+    order_id, err = place_buy_limit(kite, symbol, qty, price, paper=is_paper)
     if err:
         logger.error("BUY order failed: symbol=%s qty=%d price=%.2f err=%s", symbol, qty, price, err)
         send_alert(f"ORDER FAILED for {symbol}: {err}")
         return
 
     # DRY_RUN-only path (PAPER off, DRY on): preserve original alert-only behavior.
-    if not config.PAPER_TRADE and config.DRY_RUN:
+    if not is_paper and config.DRY_RUN:
         send_alert(f"[DRY_RUN] Order placed: {symbol} BUY {qty} @ LIMIT ₹{price}")
         return
 
     # Determine the actual fill. PAPER simulates a full fill at the alert-time
     # limit; LIVE confirms with the broker, because placing != filling — a
     # marketable limit can rest unfilled if price jumped before the tap.
-    if config.PAPER_TRADE:
+    if is_paper:
         fill_qty, fill_price = qty, price
     else:
         fill_qty, avg_price, status = confirm_order_fill(
@@ -677,7 +732,7 @@ def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx,
 
     # Journal the buy (with the signal's volume-profile context) and arm monitoring.
     signal_type = "UP" if symbol.endswith("CE") else "DOWN"
-    mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+    mode = "PAPER" if is_paper else "LIVE"
     ctx = signal_ctx.get(symbol)
     with db_lock:
         entry_id = trades_db.record_buy(
@@ -696,7 +751,7 @@ def enter_position(kite, symbol, price, qty, conn, db_lock, tracker, signal_ctx,
         fill_price * (1 - config.SL_PCT), config.USE_TRAILING_STOP,
     )
 
-    mode_tag = "[PAPER] " if config.PAPER_TRADE else ""
+    mode_tag = "[PAPER] " if is_paper else ""
     conv = ctx.get("conviction")
     conv_line = f"\nConviction: {conv}" if conv and conv != "n/a" else ""
     if config.USE_TRAILING_STOP:
@@ -933,7 +988,15 @@ def main():
         except Exception:
             spot = close
 
-        opt = itm_option(spot, signal, instruments_nfo)
+        # DTE routing: weekly (early cycle) vs monthly (<= DTE_MONTHLY_MAX, late
+        # cycle). Weekly is paper-tracked only; monthly is the actionable trade.
+        monthly_dte = days_to_expiry(fut["expiry"], now.date())
+        plan = select_trade_plan(
+            monthly_dte, config.DTE_MONTHLY_MAX,
+            getattr(config, "WEEKLY_TRACK_ONLY", True),
+        )
+        target_expiry = fut["expiry"] if plan["use_monthly"] else None
+        opt = itm_option(spot, signal, instruments_nfo, target_expiry=target_expiry)
         if opt is None:
             send_alert(
                 f"{signal} signal but no ITM option found near spot {spot}. "
@@ -975,6 +1038,13 @@ def main():
         ref_level = orb_high if signal == "UP" else orb_low
         sign = "+" if signal == "UP" else "-"
 
+        if plan["use_monthly"]:
+            regime_line = f"Expiry: MONTHLY · {monthly_dte}d to expiry — ACTIONABLE"
+        elif plan["track_only"]:
+            regime_line = f"Expiry: WEEKLY · monthly {monthly_dte}d out — TRACKING ONLY (no order)"
+        else:
+            regime_line = f"Expiry: WEEKLY · monthly {monthly_dte}d out — ACTIONABLE"
+
         # Developing volume profile (V5) — used only to TAG conviction, never to
         # gate. UP is high-conviction when the breakout close clears VAH; DOWN
         # when it clears VAL. Built from the day's 1-min futures candles.
@@ -1001,6 +1071,7 @@ def main():
             f"VWAP: {vwap_str}\n"
             f"Spot Nifty: {spot}\n"
             f"{va_line}\n"
+            f"{regime_line}\n"
             f"ITM-1 {buy_side}: {opt_symbol}\n"
             f"Bid/Ask: {bid_ask}"
         )
@@ -1017,7 +1088,10 @@ def main():
                 limit_price, config.SL_PCT, config.LOT_SIZE,
                 config.RISK_PER_TRADE_INR, config.MAX_LOTS,
             )
-            journal_mode = "PAPER" if config.PAPER_TRADE else "LIVE"
+            # Weekly early-cycle signals are paper-tracked even in LIVE mode, so
+            # the loss-limit gate is checked against the mode this trade will use.
+            effective_paper = True if plan["track_only"] else config.PAPER_TRADE
+            journal_mode = "PAPER" if effective_paper else "LIVE"
             with db_lock:
                 mtd_pnl = trades_db.month_to_date_pnl(
                     conn, journal_mode, now.strftime("%Y-%m")
@@ -1040,7 +1114,19 @@ def main():
                 signal_ctx.set(opt_symbol, {
                     "vah": vah_v, "val": val_v, "poc": poc_v, "conviction": conviction,
                 })
-                if config.PAPER_TRADE and getattr(config, "PAPER_AUTO_ENTER", False):
+                if plan["track_only"]:
+                    # Weekly (early cycle): record as PAPER for the performance
+                    # track only — NO button, nothing to act on. You trade only
+                    # the monthly (late-cycle) recommendations.
+                    send_alert(
+                        body + f"\nLIMIT: ₹{limit_price} | Qty: {qty}\n"
+                        f"[TRACKING ONLY — weekly journaled as paper, not actionable]"
+                    )
+                    enter_position(
+                        kite, opt_symbol, limit_price, qty,
+                        conn, db_lock, tracker, signal_ctx, paper=True,
+                    )
+                elif config.PAPER_TRADE and getattr(config, "PAPER_AUTO_ENTER", False):
                     # TEMPORARY (Telegram India ban): no tap reachable, so enter
                     # the paper trade directly. The alert is still sent for the
                     # record (no button — enter_position confirms the fill).

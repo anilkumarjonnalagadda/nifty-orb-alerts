@@ -50,6 +50,8 @@ _cfg.DB_PATH = ":memory:"
 _cfg.RISK_PER_TRADE_INR = 5000
 _cfg.MAX_LOTS = 1
 _cfg.MONTHLY_LOSS_LIMIT_INR = 15000
+_cfg.DTE_MONTHLY_MAX = 15
+_cfg.WEEKLY_TRACK_ONLY = True
 _cfg.FILL_CONFIRM_TIMEOUT_SECONDS = 8
 _cfg.FILL_POLL_SECONDS = 1
 _cfg.VP_BIN_WIDTH = 5.0
@@ -73,6 +75,8 @@ from orb_monitor import (  # noqa: E402
     classify_fill,
     extract_bid_ask,
     itm_option,
+    days_to_expiry,
+    select_trade_plan,
     position_size,
     round_to_tick,
     volume_profile,
@@ -558,6 +562,76 @@ class TestItmOption:
         # Spot far outside our mock strike range
         opt = itm_option(spot=99000, direction="UP", instruments_nfo=_mock_instruments())
         assert opt is None
+
+    def test_target_expiry_picks_that_expiry(self):
+        # V7: explicit target_expiry (the monthly) selects that expiry, not nearest.
+        insts = _mock_instruments()
+        near, far = sorted({i["expiry"] for i in insts})[:2]
+        opt = itm_option(spot=24500, direction="UP", instruments_nfo=insts, target_expiry=far)
+        assert opt["expiry"] == far
+        assert opt["strike"] == 24450
+
+    def test_target_expiry_none_is_nearest(self):
+        insts = _mock_instruments()
+        near = sorted({i["expiry"] for i in insts})[0]
+        opt = itm_option(spot=24500, direction="UP", instruments_nfo=insts, target_expiry=None)
+        assert opt["expiry"] == near
+
+    def test_target_expiry_falls_back_to_next_on_or_after(self):
+        # A date with no exact contract → nearest expiry on/after it.
+        insts = _mock_instruments()
+        near, far = sorted({i["expiry"] for i in insts})[:2]
+        opt = itm_option(spot=24500, direction="UP",
+                         instruments_nfo=insts, target_expiry=near + timedelta(days=1))
+        assert opt["expiry"] == far
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V7 — DTE routing: days_to_expiry + select_trade_plan
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDaysToExpiry:
+
+    def test_plain_date(self):
+        today = datetime(2026, 6, 11).date()
+        exp = datetime(2026, 6, 25).date()
+        assert days_to_expiry(exp, today) == 14
+
+    def test_datetime_expiry_is_normalized(self):
+        today = datetime(2026, 6, 11).date()
+        exp = datetime(2026, 6, 25, 15, 30)  # datetime, not date
+        assert days_to_expiry(exp, today) == 14
+
+    def test_same_day_is_zero(self):
+        d = datetime(2026, 6, 25).date()
+        assert days_to_expiry(d, d) == 0
+
+
+class TestSelectTradePlan:
+
+    def test_monthly_within_max_dte_is_actionable(self):
+        plan = select_trade_plan(monthly_dte=3, max_dte=15, weekly_track_only=True)
+        assert plan["regime"] == "monthly"
+        assert plan["use_monthly"] is True
+        assert plan["actionable"] is True
+        assert plan["track_only"] is False
+
+    def test_boundary_at_max_dte_is_monthly(self):
+        assert select_trade_plan(15, 15, True)["use_monthly"] is True
+        assert select_trade_plan(16, 15, True)["use_monthly"] is False
+
+    def test_weekly_track_only_when_far(self):
+        plan = select_trade_plan(monthly_dte=20, max_dte=15, weekly_track_only=True)
+        assert plan["regime"] == "weekly"
+        assert plan["use_monthly"] is False
+        assert plan["track_only"] is True
+        assert plan["actionable"] is False
+
+    def test_weekly_actionable_when_track_off(self):
+        plan = select_trade_plan(monthly_dte=20, max_dte=15, weekly_track_only=False)
+        assert plan["use_monthly"] is False
+        assert plan["track_only"] is False
+        assert plan["actionable"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1083,3 +1157,38 @@ class TestEnterPositionAutoEnter:
         # At-most-one position: no new journal row, original position intact.
         assert conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"] == 0
         assert tracker.current()["id"] == 1
+
+
+# ── V7: weekly track stays PAPER even when the bot is LIVE ────────────────────
+
+class TestWeeklyTrackPaperOverride:
+    """The money-safety crux: a weekly (early-cycle) track must journal + manage
+    as PAPER and place NO live order, even when config is LIVE (paper=True)."""
+
+    def test_paper_override_journals_paper_while_live(self):
+        import threading
+        # Simulate LIVE global config; the per-entry override must still be PAPER.
+        saved_paper, saved_dry = _cfg.PAPER_TRADE, _cfg.DRY_RUN
+        _cfg.PAPER_TRADE, _cfg.DRY_RUN = False, False
+        try:
+            conn = trades_db.init_db(":memory:")
+            tracker = PositionTracker()
+            ctx = SignalContext()
+            symbol = "NIFTY26JUN24000CE"
+            ctx.set(symbol, {"vah": None, "val": None, "poc": None, "conviction": "normal"})
+
+            # kite=None proves no live broker call happens on the paper path.
+            enter_position(None, symbol, 100.0, 65, conn,
+                           threading.Lock(), tracker, ctx, cb_id=None, paper=True)
+
+            pos = tracker.current()
+            assert pos is not None
+            assert pos["mode"] == "PAPER"
+            assert pos["entry_price"] == 100.0
+            row = conn.execute(
+                "SELECT mode, exit_ts FROM trades WHERE id=?", (pos["id"],)
+            ).fetchone()
+            assert row["mode"] == "PAPER"
+            assert row["exit_ts"] is None
+        finally:
+            _cfg.PAPER_TRADE, _cfg.DRY_RUN = saved_paper, saved_dry
