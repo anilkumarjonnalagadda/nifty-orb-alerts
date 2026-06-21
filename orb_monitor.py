@@ -204,6 +204,45 @@ def select_trade_plan(monthly_dte, max_dte, weekly_track_only):
             "actionable": not bool(weekly_track_only)}
 
 
+# ── Signal-quality gates (V7): VAH + put-OI support (match the backtest) ──────
+
+def support_pe_strikes(spot, step=50):
+    """The two OTM put strikes just below spot used for the put-OI support read:
+    (ATM-1step, ATM-2step), where ATM is the nearest `step` to spot. These are
+    the spot-1 / spot-2 puts whose rising OI = put writers building support."""
+    atm = round(spot / step) * step
+    return atm - step, atm - 2 * step
+
+
+def pe_symbol_at_strike(strike, instruments_nfo):
+    """Nearest-weekly PE tradingsymbol at `strike`, or None if absent."""
+    today = now_ist().date()
+    opts = [
+        i for i in instruments_nfo
+        if i["name"] == "NIFTY" and i["instrument_type"] == "PE"
+        and i["strike"] == strike and i["expiry"] >= today
+    ]
+    opts.sort(key=lambda x: x["expiry"])
+    return opts[0]["tradingsymbol"] if opts else None
+
+
+def put_oi_rising(current_oi, baseline_oi):
+    """True when combined support-put OI has RISEN vs the 09:30 baseline (put
+    writers building support beneath price → bullish CE confirm). False if either
+    reading is missing or the baseline is non-positive. Must strictly rise."""
+    return (current_oi is not None and baseline_oi is not None
+            and baseline_oi > 0 and current_oi > baseline_oi)
+
+
+def vah_gate_ok(direction, close, vah, val):
+    """Value-area gate: UP must close ABOVE VAH, DOWN must close BELOW VAL. False
+    when the needed level is missing (= no trade), matching the backtest, which
+    skips when the value area is unavailable."""
+    if direction == "UP":
+        return vah is not None and close > vah
+    return val is not None and close < val
+
+
 # ── Limit price calc (V2) ────────────────────────────────────────────────────
 
 
@@ -457,6 +496,31 @@ def place_sell_limit(kite, tradingsymbol, qty, price, paper=None):
         return order_id, None
     except Exception as e:
         return None, str(e)
+
+
+# ── Put-OI support read (V7) ─────────────────────────────────────────────────
+
+def fetch_combined_oi(kite, symbols):
+    """Sum the open interest of the given NFO option symbols in one quote call.
+    Returns total OI (float) or None if unavailable. I/O wrapper — the gate
+    decision lives in put_oi_rising()."""
+    syms = [f"NFO:{s}" for s in symbols if s]
+    if not syms:
+        return None
+    try:
+        q = kite.quote(syms)
+    except Exception as e:
+        logger.error("put-OI quote fetch failed: %s", e)
+        return None
+    total = 0.0
+    got = False
+    for s in syms:
+        d = q.get(s) or {}
+        oi = d.get("oi")
+        if oi is not None and oi > 0:
+            total += float(oi)
+            got = True
+    return total if got else None
 
 
 # ── Position tracking (V3) ───────────────────────────────────────────────────
@@ -893,6 +957,26 @@ def main():
         f"Watching 5-min closes for breakout/breakdown..."
     )
 
+    # Put-OI support baseline (V7): snapshot the combined OI of the two OTM puts
+    # just below spot ("support" strikes) right after the ORB forms (~09:30:30).
+    # An UP breakout later requires this OI to have RISEN (put writers building
+    # support = bullish). Strikes are FIXED here so the read doesn't drift.
+    sup_oi_syms = []
+    sup_oi_base = None
+    try:
+        snap_spot = kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
+        s1, s2 = support_pe_strikes(snap_spot)
+        sup_oi_syms = [
+            pe_symbol_at_strike(s1, instruments_nfo),
+            pe_symbol_at_strike(s2, instruments_nfo),
+        ]
+        sup_oi_base = fetch_combined_oi(kite, sup_oi_syms)
+    except Exception as e:
+        logger.error("put-OI baseline snapshot failed: %s", e)
+    logger.info("PUTOI_BASELINE syms=%s base=%s", sup_oi_syms, sup_oi_base)
+    if sup_oi_base is None:
+        logger.warning("put-OI baseline unavailable — UP put-OI gate will FAIL-OPEN today")
+
     max_fires = config.MAX_FIRES_PER_DIRECTION
     state = {
         "UP": {"fires": 0, "needs_reset": False},
@@ -983,6 +1067,29 @@ def main():
         if signal is None:
             continue
 
+        # ── Signal-quality gates (V7) — evaluated BEFORE consuming a fire so a
+        # suppressed signal can re-fire later, exactly like the backtest. The
+        # value area is built from the day's 1-min candles (no warmup gate, to
+        # match the backtest). These gates apply to UP (the validated CE side);
+        # DOWN is left unchanged (logged only, not the validated edge).
+        vp = (volume_profile(candles_1m, config.VP_BIN_WIDTH, config.VP_VALUE_AREA_PCT)
+              if candles_1m else None)
+        poc_v, vah_v, val_v = vp if vp else (None, None, None)
+
+        if signal == "UP":
+            # VAH gate: breakout must clear the value-area high.
+            if not vah_gate_ok("UP", close, vah_v, val_v):
+                logger.info("SIGNAL_SUPPRESSED dir=UP gate=VAH close=%.2f vah=%s", close, vah_v)
+                continue
+            # Put-OI gate: support-put OI must have risen since 09:30. Fail-OPEN
+            # if the baseline couldn't be snapshotted (don't lose the whole day).
+            if sup_oi_base is not None:
+                cur_oi = fetch_combined_oi(kite, sup_oi_syms)
+                if not put_oi_rising(cur_oi, sup_oi_base):
+                    logger.info("SIGNAL_SUPPRESSED dir=UP gate=putOI cur=%s base=%s",
+                                cur_oi, sup_oi_base)
+                    continue
+
         try:
             spot = kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
         except Exception:
@@ -1045,13 +1152,10 @@ def main():
         else:
             regime_line = f"Expiry: WEEKLY · monthly {monthly_dte}d out — ACTIONABLE"
 
-        # Developing volume profile (V5) — used only to TAG conviction, never to
-        # gate. UP is high-conviction when the breakout close clears VAH; DOWN
-        # when it clears VAL. Built from the day's 1-min futures candles.
-        vp = (volume_profile(candles_1m, config.VP_BIN_WIDTH, config.VP_VALUE_AREA_PCT)
-              if candles_1m and len(candles_1m) >= config.VP_WARMUP_MINUTES else None)
+        # Volume-profile conviction tag — reuses the value area computed for the
+        # gate above. UP that reached here already cleared VAH (it's gated), so
+        # UP is HIGH by construction; DOWN (ungated) still varies.
         if vp:
-            poc_v, vah_v, val_v = vp
             high_conv = (close > vah_v) if signal == "UP" else (close < val_v)
             conviction = "HIGH" if high_conv else "normal"
             edge = f"VAH {vah_v:.0f}" if signal == "UP" else f"VAL {val_v:.0f}"
@@ -1059,9 +1163,8 @@ def main():
                          else f"normal — inside value ({edge})")
             va_line = f"VA: POC {poc_v:.0f} / VAH {vah_v:.0f} / VAL {val_v:.0f}\n{conv_desc}"
         else:
-            poc_v = vah_v = val_v = None
             conviction = "n/a"
-            va_line = "VA: n/a (warmup)"
+            va_line = "VA: n/a"
 
         body = (
             f"{label_dir} — fire {fires_now}/{max_fires}\n"

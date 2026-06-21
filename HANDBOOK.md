@@ -28,12 +28,13 @@ gate|Opened INSIDE the range? (don't chase a runaway move)
 gate|Closed beyond ORB High +10 / ORB Low -10?
 gate|Volume > 1.2x the 20-candle average?
 gate|Right side of VWAP? (above for UP, below for DOWN)
+gate|Cleared the value area? (close above VAH for UP / below VAL for DOWN)
+gate|(UP only) Support-put OI rising since 9:30? (put writers building support)
 gate|Still armed? (max 2 fires per direction per day)
 process|SIGNAL — pick ITM-1 option (CE for UP, PE for DOWN)
 gate|Spread <=5% and premium <=Rs.500?
 gate|1-lot stop-loss risk <=Rs.5000? (premium <=~Rs.256)
 gate|Month's loss still under Rs.15000?
-process|Tag HIGH CONVICTION if it also cleared the value area (VAH/VAL)
 end|Telegram alert with BUY button — nothing is bought until you tap
 ```
 
@@ -43,11 +44,14 @@ end|Telegram alert with BUY button — nothing is bought until you tap
 3. **Clean break** — close must clear ORB High **+10 pts** (UP) or ORB Low **−10 pts** (DOWN).
 4. **Volume** — breakout volume > **1.2×** the 20-candle average.
 5. **VWAP** — close above VWAP for UP, below for DOWN.
-6. **Armed / fire limit** — max **2 fires per direction** per day; after a fire, price must pull back ≥15 pts into the range to re-arm.
-7. **Expiry + option** — pick ITM-1 on the **monthly** (≤15 days to monthly expiry → actionable) or the **weekly** (earlier in the cycle → tracked only); skip the button if spread >5% or premium >₹500.
-8. **Risk sizing** — take 1 lot only if its worst-case stop-loss is ≤ **₹5,000** (premium ≲ ₹256); otherwise skip.
-9. **Monthly loss limit** — if the month's realized loss has hit **₹15,000**, pause until next month.
-10. **Conviction tag** — if the breakout also cleared the day's value area, the alert is marked **★ HIGH CONVICTION** (information only — still 1 lot).
+6. **Value area (VAH/VAL)** — the close must clear the day's value area: **above VAH** for UP, **below VAL** for DOWN. (This used to be only a label; it's now a real filter, matching the backtest.)
+7. **Put-OI support (UP only)** — for an UP breakout, the combined open-interest of the two puts just below spot must have **risen since 9:30** (put writers building support beneath price = bullish confirmation). This is the put-side OI edge that passed the walk-forward backtest. If the 9:30 reading can't be fetched, this check is skipped for the day (fail-open) so a data hiccup doesn't block everything.
+8. **Armed / fire limit** — max **2 fires per direction** per day; after a fire, price must pull back ≥15 pts into the range to re-arm.
+9. **Expiry + option** — pick ITM-1 on the **monthly** (≤15 days to monthly expiry → actionable) or the **weekly** (earlier in the cycle → tracked only); skip the button if spread >5% or premium >₹500.
+10. **Risk sizing** — take 1 lot only if its worst-case stop-loss is ≤ **₹5,000** (premium ≲ ₹256); otherwise skip.
+11. **Monthly loss limit** — if the month's realized loss has hit **₹15,000**, pause until next month.
+
+Because UP breakouts must now clear VAH to fire at all, every UP alert is high-conviction by construction (you'll still see the **★** marker on it). DOWN signals are logged for analysis but are not the validated edge.
 
 ### After you tap: the bot runs the trade by itself
 
@@ -320,10 +324,10 @@ You'll see this if the safety guards rejected the auto-order:
 
 The alert still fires — you just don't get the button.
 
-### "★ HIGH CONVICTION" tag (V5)
-Some signals carry a `★ HIGH CONVICTION` tag on the button and a `VA: POC.. / VAH.. / VAL..` line in the alert. This means the breakout cleared the day's **value area** (where most volume traded) — historically a higher-quality setup. A signal without the star is `normal — inside value`.
+### "★ HIGH CONVICTION" tag (V5 → now a gate for UP)
+Alerts carry a `★ HIGH CONVICTION` tag and a `VA: POC.. / VAH.. / VAL..` line showing the day's value area. Clearing the value area used to be just a label; **as of V7 it's a required filter** — an UP breakout must close above VAH (and DOWN below VAL) to fire at all. So every **UP** alert you receive is high-conviction by construction (the ★ will be there). DOWN alerts (logged, not the validated trade) can still show `normal`.
 
-**Important:** this is *information only*. Both kinds still fire and both still place **one lot** if you tap. The star does **not** mean "trade bigger" — size is always 1 lot. We're collecting data to learn whether high-conviction signals actually win more.
+**Important:** the star does **not** mean "trade bigger" — size is always **one lot**. It's a quality marker, not a sizing signal.
 
 ### "TRACKING ONLY" (weekly, early in the cycle)
 Earlier in the monthly cycle (monthly more than 15 days out) you'll see alerts like:
@@ -579,8 +583,7 @@ If you're not comfortable with systemd, **stick with `nohup`** — it works fine
 | **V4** | Done | Risk-based position sizing; monthly loss limit |
 | **V5** | Done | Live fill-confirmation; VAH/VAL high-conviction tagging |
 | **V6** | Done | Trailing-stop exit ("let winners run"); `USE_TRAILING_STOP` flag |
-| **V7** | **Live (paper)** | DTE expiry routing: monthly ITM-1 (≤15 DTE, actionable) vs weekly (early cycle, paper-tracked) — `DTE_MONTHLY_MAX`, `WEEKLY_TRACK_ONLY`. Paper-validating before live flip |
-| **V7+** | Researching | Put-side support-OI confirmation filter — passed walk-forward backtest; paper-observe ~1 month before adoption |
+| **V7** | **Live (paper)** | DTE expiry routing (monthly ≤15 DTE actionable / weekly early-cycle paper-tracked) **+ VAH gate + put-side support-OI gate** — the full validated strategy. `DTE_MONTHLY_MAX`, `WEEKLY_TRACK_ONLY`. Paper-validating before live flip |
 | **Later** | Maybe | Multi-symbol (BankNifty, FinNifty); holiday calendar; web dashboard with live P&L |
 
 ---

@@ -77,6 +77,11 @@ from orb_monitor import (  # noqa: E402
     itm_option,
     days_to_expiry,
     select_trade_plan,
+    support_pe_strikes,
+    pe_symbol_at_strike,
+    put_oi_rising,
+    vah_gate_ok,
+    fetch_combined_oi,
     position_size,
     round_to_tick,
     volume_profile,
@@ -632,6 +637,64 @@ class TestSelectTradePlan:
         assert plan["use_monthly"] is False
         assert plan["track_only"] is False
         assert plan["actionable"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V7 — signal-quality gates: VAH gate + put-OI support
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPutOiAndVahGates:
+
+    def test_support_pe_strikes_at_strike(self):
+        assert support_pe_strikes(24500) == (24450, 24400)
+
+    def test_support_pe_strikes_rounds_to_atm(self):
+        # 24527 → ATM 24550 → supports 24500, 24450
+        assert support_pe_strikes(24527) == (24500, 24450)
+
+    def test_pe_symbol_at_strike_found(self):
+        sym = pe_symbol_at_strike(24450, _mock_instruments())
+        assert sym is not None and sym.endswith("PE") and "24450" in sym
+
+    def test_pe_symbol_at_strike_missing(self):
+        assert pe_symbol_at_strike(99999, _mock_instruments()) is None
+
+    def test_put_oi_rising_true(self):
+        assert put_oi_rising(1200, 1000) is True
+
+    def test_put_oi_rising_flat_or_falling(self):
+        assert put_oi_rising(1000, 1000) is False   # must strictly rise
+        assert put_oi_rising(900, 1000) is False
+
+    def test_put_oi_rising_missing_or_zero_base(self):
+        assert put_oi_rising(None, 1000) is False
+        assert put_oi_rising(1200, None) is False
+        assert put_oi_rising(1200, 0) is False
+
+    def test_vah_gate_up(self):
+        assert vah_gate_ok("UP", 105, vah=100, val=90) is True
+        assert vah_gate_ok("UP", 100, vah=100, val=90) is False   # not strictly above
+        assert vah_gate_ok("UP", 105, vah=None, val=90) is False  # no value area
+
+    def test_vah_gate_down(self):
+        assert vah_gate_ok("DOWN", 85, vah=100, val=90) is True
+        assert vah_gate_ok("DOWN", 90, vah=100, val=90) is False
+        assert vah_gate_ok("DOWN", 85, vah=100, val=None) is False
+
+    def test_fetch_combined_oi_sums(self):
+        class _K:
+            def quote(self, syms):
+                return {"NFO:A": {"oi": 1000}, "NFO:B": {"oi": 500}}
+        assert fetch_combined_oi(_K(), ["A", "B"]) == 1500
+
+    def test_fetch_combined_oi_empty_is_none(self):
+        assert fetch_combined_oi(None, []) is None
+
+    def test_fetch_combined_oi_none_when_no_oi(self):
+        class _K:
+            def quote(self, syms):
+                return {"NFO:A": {}, "NFO:B": {"oi": 0}}
+        assert fetch_combined_oi(_K(), ["A", "B"]) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
