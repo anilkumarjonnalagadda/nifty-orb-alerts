@@ -80,6 +80,9 @@ from orb_monitor import (  # noqa: E402
     support_pe_strikes,
     pe_symbol_at_strike,
     put_oi_rising,
+    resistance_ce_strikes,
+    ce_symbol_at_strike,
+    call_oi_rising,
     vah_gate_ok,
     fetch_combined_oi,
     position_size,
@@ -695,6 +698,41 @@ class TestPutOiAndVahGates:
             def quote(self, syms):
                 return {"NFO:A": {}, "NFO:B": {"oi": 0}}
         assert fetch_combined_oi(_K(), ["A", "B"]) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V8 — call-OI resistance gate (DOWN/PE mirror of put-OI support)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCallOiResistanceGate:
+
+    def test_resistance_ce_strikes_at_strike(self):
+        # Calls just ABOVE spot (mirror of support_pe_strikes which is below).
+        assert resistance_ce_strikes(24500) == (24550, 24600)
+
+    def test_resistance_ce_strikes_rounds_to_atm(self):
+        # 24527 rounds to ATM 24550 → resistance = 24600, 24650.
+        assert resistance_ce_strikes(24527) == (24600, 24650)
+
+    def test_ce_symbol_at_strike_found(self):
+        sym = ce_symbol_at_strike(24600, _mock_instruments())
+        assert sym is not None
+        assert sym.endswith("24600CE")
+
+    def test_ce_symbol_at_strike_missing(self):
+        assert ce_symbol_at_strike(99999, _mock_instruments()) is None
+
+    def test_call_oi_rising_true(self):
+        assert call_oi_rising(1200, 1000) is True
+
+    def test_call_oi_rising_flat_or_falling(self):
+        assert call_oi_rising(1000, 1000) is False   # must strictly rise
+        assert call_oi_rising(900, 1000) is False
+
+    def test_call_oi_rising_missing_or_zero_base(self):
+        assert call_oi_rising(None, 1000) is False
+        assert call_oi_rising(1200, None) is False
+        assert call_oi_rising(1200, 0) is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -234,6 +234,36 @@ def put_oi_rising(current_oi, baseline_oi):
             and baseline_oi > 0 and current_oi > baseline_oi)
 
 
+def resistance_ce_strikes(spot, step=50):
+    """The two OTM call strikes just above spot used for the call-OI resistance
+    read: (ATM+1step, ATM+2step), where ATM is the nearest `step` to spot. These
+    are the spot+1 / spot+2 calls whose rising OI = call writers building
+    resistance overhead. Mirror of support_pe_strikes for the DOWN/PE side."""
+    atm = round(spot / step) * step
+    return atm + step, atm + 2 * step
+
+
+def ce_symbol_at_strike(strike, instruments_nfo):
+    """Nearest-weekly CE tradingsymbol at `strike`, or None if absent.
+    Mirror of pe_symbol_at_strike."""
+    today = now_ist().date()
+    opts = [
+        i for i in instruments_nfo
+        if i["name"] == "NIFTY" and i["instrument_type"] == "CE"
+        and i["strike"] == strike and i["expiry"] >= today
+    ]
+    opts.sort(key=lambda x: x["expiry"])
+    return opts[0]["tradingsymbol"] if opts else None
+
+
+def call_oi_rising(current_oi, baseline_oi):
+    """True when combined resistance-call OI has RISEN vs the 09:30 baseline (call
+    writers building resistance overhead → bearish DOWN confirm). Mirror of
+    put_oi_rising; same strictly-rise / missing-or-zero-base semantics."""
+    return (current_oi is not None and baseline_oi is not None
+            and baseline_oi > 0 and current_oi > baseline_oi)
+
+
 def vah_gate_ok(direction, close, vah, val):
     """Value-area gate: UP must close ABOVE VAH, DOWN must close BELOW VAL. False
     when the needed level is missing (= no trade), matching the backtest, which
@@ -977,6 +1007,27 @@ def main():
     if sup_oi_base is None:
         logger.warning("put-OI baseline unavailable — UP put-OI gate will FAIL-OPEN today")
 
+    # Call-OI resistance baseline (V8): mirror of the put-OI support read for the
+    # DOWN/PE side. Combined OI of the two OTM calls just ABOVE spot, snapshotted
+    # at ~09:30:30. A DOWN breakdown later requires this OI to have RISEN (call
+    # writers building resistance overhead = bearish confirm). PE stays a
+    # LOW-conviction, paper-only side — this gate just filters the noise.
+    res_oi_syms = []
+    res_oi_base = None
+    try:
+        snap_spot_c = kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
+        r1, r2 = resistance_ce_strikes(snap_spot_c)
+        res_oi_syms = [
+            ce_symbol_at_strike(r1, instruments_nfo),
+            ce_symbol_at_strike(r2, instruments_nfo),
+        ]
+        res_oi_base = fetch_combined_oi(kite, res_oi_syms)
+    except Exception as e:
+        logger.error("call-OI baseline snapshot failed: %s", e)
+    logger.info("CALLOI_BASELINE syms=%s base=%s", res_oi_syms, res_oi_base)
+    if res_oi_base is None:
+        logger.warning("call-OI baseline unavailable — DOWN call-OI gate will FAIL-OPEN today")
+
     max_fires = config.MAX_FIRES_PER_DIRECTION
     state = {
         "UP": {"fires": 0, "needs_reset": False},
@@ -1070,8 +1121,9 @@ def main():
         # ── Signal-quality gates (V7) — evaluated BEFORE consuming a fire so a
         # suppressed signal can re-fire later, exactly like the backtest. The
         # value area is built from the day's 1-min candles (no warmup gate, to
-        # match the backtest). These gates apply to UP (the validated CE side);
-        # DOWN is left unchanged (logged only, not the validated edge).
+        # match the backtest). UP gets VAH + put-OI support (the validated CE
+        # edge); DOWN gets the mirror VAL + call-OI resistance gate but stays a
+        # LOW-conviction, paper-only side (PE is not the validated edge).
         vp = (volume_profile(candles_1m, config.VP_BIN_WIDTH, config.VP_VALUE_AREA_PCT)
               if candles_1m else None)
         poc_v, vah_v, val_v = vp if vp else (None, None, None)
@@ -1088,6 +1140,21 @@ def main():
                 if not put_oi_rising(cur_oi, sup_oi_base):
                     logger.info("SIGNAL_SUPPRESSED dir=UP gate=putOI cur=%s base=%s",
                                 cur_oi, sup_oi_base)
+                    continue
+        else:  # signal == "DOWN"
+            # VAL gate: breakdown must close below the value-area low (mirror of
+            # the UP VAH gate).
+            if not vah_gate_ok("DOWN", close, vah_v, val_v):
+                logger.info("SIGNAL_SUPPRESSED dir=DOWN gate=VAL close=%.2f val=%s", close, val_v)
+                continue
+            # Call-OI gate: resistance-call OI must have risen since 09:30 (call
+            # writers building a ceiling overhead = bearish confirm). Fail-OPEN if
+            # the baseline couldn't be snapshotted.
+            if res_oi_base is not None:
+                cur_coi = fetch_combined_oi(kite, res_oi_syms)
+                if not call_oi_rising(cur_coi, res_oi_base):
+                    logger.info("SIGNAL_SUPPRESSED dir=DOWN gate=callOI cur=%s base=%s",
+                                cur_coi, res_oi_base)
                     continue
 
         try:
@@ -1153,14 +1220,17 @@ def main():
             regime_line = f"Expiry: WEEKLY · monthly {monthly_dte}d out — ACTIONABLE"
 
         # Volume-profile conviction tag — reuses the value area computed for the
-        # gate above. UP that reached here already cleared VAH (it's gated), so
-        # UP is HIGH by construction; DOWN (ungated) still varies.
+        # gate above. Both sides reached here already cleared their value-area
+        # edge (gated): UP is HIGH by construction; DOWN/PE passed VAL + call-OI
+        # but stays LOW conviction — PE is not the validated edge, paper only.
         if vp:
-            high_conv = (close > vah_v) if signal == "UP" else (close < val_v)
-            conviction = "HIGH" if high_conv else "normal"
-            edge = f"VAH {vah_v:.0f}" if signal == "UP" else f"VAL {val_v:.0f}"
-            conv_desc = (f"★ HIGH CONVICTION — cleared {edge}" if high_conv
-                         else f"normal — inside value ({edge})")
+            if signal == "UP":
+                conviction = "HIGH"
+                conv_desc = f"★ HIGH CONVICTION — cleared VAH {vah_v:.0f}"
+            else:
+                conviction = "LOW"
+                conv_desc = (f"⚠ LOW CONVICTION (PE — experimental, paper only) — "
+                             f"below VAL {val_v:.0f}, call-OI resistance rising")
             va_line = f"VA: POC {poc_v:.0f} / VAH {vah_v:.0f} / VAL {val_v:.0f}\n{conv_desc}"
         else:
             conviction = "n/a"

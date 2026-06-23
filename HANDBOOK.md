@@ -29,7 +29,7 @@ gate|Closed beyond ORB High +10 / ORB Low -10?
 gate|Volume > 1.2x the 20-candle average?
 gate|Right side of VWAP? (above for UP, below for DOWN)
 gate|Cleared the value area? (close above VAH for UP / below VAL for DOWN)
-gate|(UP only) Support-put OI rising since 9:30? (put writers building support)
+gate|UP: support-put OI rising since 9:30? / DOWN: resistance-call OI rising since 9:30?
 gate|Still armed? (max 2 fires per direction per day)
 process|SIGNAL — pick ITM-1 option (CE for UP, PE for DOWN)
 gate|Spread <=5% and premium <=Rs.500?
@@ -45,13 +45,17 @@ end|Telegram alert with BUY button — nothing is bought until you tap
 4. **Volume** — breakout volume > **1.2×** the 20-candle average.
 5. **VWAP** — close above VWAP for UP, below for DOWN.
 6. **Value area (VAH/VAL)** — the close must clear the day's value area: **above VAH** for UP, **below VAL** for DOWN. (This used to be only a label; it's now a real filter, matching the backtest.)
-7. **Put-OI support (UP only)** — for an UP breakout, the combined open-interest of the two puts just below spot must have **risen since 9:30** (put writers building support beneath price = bullish confirmation). This is the put-side OI edge that passed the walk-forward backtest. If the 9:30 reading can't be fetched, this check is skipped for the day (fail-open) so a data hiccup doesn't block everything.
+7. **Option-OI confirmation** — the open-interest of the two out-of-the-money options *against* the move must have **risen since 9:30**:
+   - **UP** → the two puts just **below** spot (put writers building support = bullish confirm). This is the put-side OI edge that passed the walk-forward backtest.
+   - **DOWN** → the two calls just **above** spot (call writers building resistance overhead = bearish confirm). This is the mirror gate added for the PE side. ⚠ Note: this is **not** a validated edge — the PE side lost money in backtest, and call-side OI was rejected on the CE side; it's here as a noise filter, which is why every DOWN alert is flagged **LOW conviction** (see below).
+
+   If the 9:30 reading can't be fetched, the check is skipped for that day (fail-open) so a data hiccup doesn't block everything.
 8. **Armed / fire limit** — max **2 fires per direction** per day; after a fire, price must pull back ≥15 pts into the range to re-arm.
 9. **Expiry + option** — pick ITM-1 on the **monthly** (≤15 days to monthly expiry → actionable) or the **weekly** (earlier in the cycle → tracked only); skip the button if spread >5% or premium >₹500.
 10. **Risk sizing** — take 1 lot only if its worst-case stop-loss is ≤ **₹5,000** (premium ≲ ₹256); otherwise skip.
 11. **Monthly loss limit** — if the month's realized loss has hit **₹15,000**, pause until next month.
 
-Because UP breakouts must now clear VAH to fire at all, every UP alert is high-conviction by construction (you'll still see the **★** marker on it). DOWN signals are logged for analysis but are not the validated edge.
+Because UP breakouts must now clear VAH to fire at all, every UP alert is high-conviction by construction (you'll still see the **★** marker on it). DOWN breakdowns now pass the same shape of gate (VAL + rising call-OI), but because the PE side is not a validated edge every DOWN alert is flagged **⚠ LOW CONVICTION (PE — experimental, paper only)** — surface it, don't bet real money on it.
 
 ### After you tap: the bot runs the trade by itself
 
@@ -309,7 +313,7 @@ ORDER FAILED for NIFTY24MAY22650CE: <error message from Kite>
 …and you can place the trade manually in Kite.
 
 ### "BREAKDOWN (DOWN) — fire 1/2"
-Same shape but opposite — buys an ITM-1 PE (50 pts above spot).
+Same shape but opposite — buys an ITM-1 PE (50 pts above spot). Every DOWN alert now carries a **⚠ LOW CONVICTION (PE — experimental, paper only)** line. The PE side passes the mirror gate (closed below VAL + resistance-call OI rising since 9:30) but is **not** a validated money-maker — treat these as paper/observation only.
 
 ### "fire 2/2"
 A re-entry breakout after price came back inside ORB by ≥15 pts. Often **cleaner than fire 1** because the noise has been shaken out.
@@ -325,7 +329,7 @@ You'll see this if the safety guards rejected the auto-order:
 The alert still fires — you just don't get the button.
 
 ### "★ HIGH CONVICTION" tag (V5 → now a gate for UP)
-Alerts carry a `★ HIGH CONVICTION` tag and a `VA: POC.. / VAH.. / VAL..` line showing the day's value area. Clearing the value area used to be just a label; **as of V7 it's a required filter** — an UP breakout must close above VAH (and DOWN below VAL) to fire at all. So every **UP** alert you receive is high-conviction by construction (the ★ will be there). DOWN alerts (logged, not the validated trade) can still show `normal`.
+Alerts carry a `★ HIGH CONVICTION` tag and a `VA: POC.. / VAH.. / VAL..` line showing the day's value area. Clearing the value area used to be just a label; **as of V7 it's a required filter** — an UP breakout must close above VAH (and DOWN below VAL) to fire at all. So every **UP** alert you receive is high-conviction by construction (the ★ will be there). **DOWN** alerts now carry the opposite marker — **⚠ LOW CONVICTION** — by construction: they pass the same shape of gate but the PE side is not the validated edge, so it's surfaced for observation, never as a real-money recommendation.
 
 **Important:** the star does **not** mean "trade bigger" — size is always **one lot**. It's a quality marker, not a sizing signal.
 
@@ -584,6 +588,7 @@ If you're not comfortable with systemd, **stick with `nohup`** — it works fine
 | **V5** | Done | Live fill-confirmation; VAH/VAL high-conviction tagging |
 | **V6** | Done | Trailing-stop exit ("let winners run"); `USE_TRAILING_STOP` flag |
 | **V7** | **Live (paper)** | DTE expiry routing (monthly ≤15 DTE actionable / weekly early-cycle paper-tracked) **+ VAH gate + put-side support-OI gate** — the full validated strategy. `DTE_MONTHLY_MAX`, `WEEKLY_TRACK_ONLY`. Paper-validating before live flip |
+| **V8** | **Live (paper)** | DOWN/PE mirror gate: VAL + resistance-call OI rising since 9:30. PE flagged **LOW conviction** (not a validated edge — noise filter + honest flag, paper only) |
 | **Later** | Maybe | Multi-symbol (BankNifty, FinNifty); holiday calendar; web dashboard with live P&L |
 
 ---
