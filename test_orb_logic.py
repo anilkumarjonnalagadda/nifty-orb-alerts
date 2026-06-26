@@ -43,6 +43,7 @@ _cfg.PAPER_AUTO_ENTER = False
 _cfg.SL_PCT = 0.30
 _cfg.TARGET_PCT = 0.50
 _cfg.USE_TRAILING_STOP = True
+_cfg.TRAIL_STEP_PCT = 0.15
 _cfg.SQUARE_OFF_HOUR = 15
 _cfg.SQUARE_OFF_MINUTE = 15
 _cfg.POSITION_POLL_SECONDS = 60
@@ -914,11 +915,17 @@ class TestDecideExit:
         result = decide_exit(self.ENTRY, 50.0, now, self._square_off(), 0.30, 0.50)
         assert result == "SL"
 
-    # ── V6: trailing-stop mode (use_trailing=True) ────────────────────────────
+    # ── V6: stepped ("ladder") trailing-stop mode (use_trailing=True) ──────────
+    # ENTRY=100, SL_PCT=0.30, TRAIL_STEP_PCT=0.15 → step_amt=15, initial stop=70.
+    # The stop ratchets up 15 for every full 15 the peak rises above entry:
+    #   peak<115 → n=0 stop=70 ;  peak in [115,130) → n=1 stop=85 ;
+    #   peak in [130,145) → n=2 stop=100 ; peak=150 → n=3 stop=115 ;
+    #   peak=160 → n=4 stop=130 ; peak=200 → n=6 stop=160.
 
     def _trail(self, current, peak, now=None):
         return decide_exit(self.ENTRY, current, now or self._now(), self._square_off(),
-                           self.SL, self.TG, peak_price=peak, use_trailing=True)
+                           self.SL, self.TG, peak_price=peak, use_trailing=True,
+                           trail_step_pct=0.15)
 
     def test_trail_initial_stop_at_minus_30(self):
         # No rise yet (peak==entry): stop is entry-30% = 70.
@@ -929,18 +936,34 @@ class TestDecideExit:
         # +60% with no pullback from the peak must NOT exit (trailing has no target).
         assert self._trail(160.0, 160.0) is None
 
+    def test_trail_holds_between_steps(self):
+        # Peaked at 114 (+14%, less than one 15% step): stop has NOT ratcheted,
+        # still 70. A pullback to 84 must NOT exit; only <=70 does.
+        assert self._trail(84.0, 114.0) is None
+        assert self._trail(70.0, 114.0) == "TRAIL"
+
+    def test_trail_one_step(self):
+        # Peaked at 115 (exactly one step): stop ratchets to 70+15 = 85.
+        assert self._trail(85.0, 115.0) == "TRAIL"
+        assert self._trail(85.01, 115.0) is None
+
+    def test_trail_two_steps_to_breakeven(self):
+        # Peaked at 130 (two steps): stop = 70+30 = 100 (breakeven).
+        assert self._trail(100.0, 130.0) == "TRAIL"
+        assert self._trail(100.01, 130.0) is None
+
     def test_trail_locks_gain_after_rise(self):
-        # Peaked at 150, stop trails to 150-30 = 120.
-        assert self._trail(120.0, 150.0) == "TRAIL"   # exit locked at +20%
-        assert self._trail(121.0, 150.0) is None       # still holding
+        # Peaked at 150 → 3 steps → stop = 70+45 = 115.
+        assert self._trail(115.0, 150.0) == "TRAIL"   # exit locked at +15%
+        assert self._trail(116.0, 150.0) is None       # still holding
 
     def test_trail_big_winner(self):
-        # Peaked at 200, stop = 170; exit at +70%.
-        assert self._trail(170.0, 200.0) == "TRAIL"
-        assert self._trail(171.0, 200.0) is None
+        # Peaked at 200 → 6 steps → stop = 70+90 = 160; exit at +60%.
+        assert self._trail(160.0, 200.0) == "TRAIL"
+        assert self._trail(161.0, 200.0) is None
 
     def test_trail_new_high_does_not_exit(self):
-        # Current is the new high → stop is 30 below it → no exit.
+        # Current is the new high (180) → stop is 145 (5 steps) → no exit.
         assert self._trail(180.0, 180.0) is None
 
     def test_trail_timeout_still_overrides(self):

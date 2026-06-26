@@ -433,7 +433,7 @@ def confirm_order_fill(kite, order_id, want_qty, timeout_s, poll_s):
 # ── Exit decision (V3) ───────────────────────────────────────────────────────
 
 def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target_pct,
-                peak_price=None, use_trailing=False):
+                peak_price=None, use_trailing=False, trail_step_pct=0.15):
     """Return an exit reason ('SL' / 'TARGET' / 'TRAIL' / 'TIMEOUT') or None.
 
     TIMEOUT always fires once wall-clock `now` reaches the square-off time.
@@ -442,17 +442,25 @@ def decide_exit(entry_price, current_price, now, square_off_time, sl_pct, target
     entry*(1+target_pct). SL wins ties (defensive).
 
     Trailing mode (use_trailing=True, the V6 'let winners run' upgrade): no
-    fixed target. The stop starts at entry*(1-sl_pct) and trails up to stay
-    sl_pct*entry below the running peak (`peak_price`), locking in gains as the
-    option rises — it never moves down. Returns 'TRAIL' when that stop is hit
-    (which may be a win or a loss; the P&L tells which).
+    fixed target. STEPPED ("ladder") trail matching the validated Volrix
+    trailSL 15%/15% leg: the stop starts at entry*(1-sl_pct) and ratchets UP by
+    trail_step_pct*entry for every full trail_step_pct*entry the option's peak
+    (`peak_price`) has risen above entry. Between steps the stop holds — it does
+    NOT tighten on every uptick. (A continuous 'peak - sl_pct*entry' trail tightens
+    each tick and backtested ~1/3 worse: 11.7%->7.5% net OOS.) The stop never moves
+    down. Returns 'TRAIL' when hit (a win or a loss; the P&L tells which).
     """
     if now >= square_off_time:
         return "TIMEOUT"
     if use_trailing:
         if peak_price is None:
             peak_price = entry_price
-        stop = peak_price - sl_pct * entry_price
+        step_amt = trail_step_pct * entry_price
+        if step_amt > 0 and peak_price > entry_price:
+            steps = int((peak_price - entry_price) // step_amt)
+        else:
+            steps = 0
+        stop = entry_price * (1 - sl_pct) + steps * step_amt
         if current_price <= stop:
             return "TRAIL"
         return None
@@ -642,6 +650,7 @@ def monitor_position_tick(kite, position, tracker, conn, db_lock, square_off_tim
         entry, ltp, now_ist(), square_off_time,
         config.SL_PCT, config.TARGET_PCT,
         peak_price=peak, use_trailing=config.USE_TRAILING_STOP,
+        trail_step_pct=getattr(config, "TRAIL_STEP_PCT", 0.15),
     )
     pnl_pct = (ltp - entry) / entry * 100
     logger.info(

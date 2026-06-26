@@ -2,18 +2,26 @@
 
 Your daily operating manual for the breakout alert + 1-tap order bot running on AWS Lightsail.
 
+> **STATUS — LIVE from Mon 29 Jun 2026.** After validating the strategy end-to-end (the UP/CE
+> monthly setup reproduces ~11.7% net OOS CAGR, Sharpe ~1.7) and fixing the exit to the
+> validated **stepped trailing stop**, the bot is going **LIVE with real money, 1 lot per
+> signal, for a 3-month trial**. `DRY_RUN=False`, `PAPER_TRADE=False`, `PAPER_AUTO_ENTER=False`
+> (you tap each BUY yourself). Goal of week 1: shake out real order-placement issues. Worst-case
+> risk per trade is ~**₹9,750** (1 lot, 30% stop, premium ≤₹500). Weekly/early-cycle signals
+> stay paper-only and are never real money.
+
 ---
 
 ## What this system does
 
-Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (a −30% stop that *trails up* to lock gains as the trade rises — "let winners run" — or the end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
+Every trading day the bot watches the **Nifty current-month futures** on Zerodha and alerts you on Telegram when price breaks cleanly out of the **first 15-minute range** (the "ORB"). A qualifying breakout arrives with a **one-tap BUY button** for an ITM-1 option. You tap to enter; **the bot exits on its own** (a −30% stop that *ratchets up in 15% steps* to lock gains as the trade rises — "let winners run" — or the end-of-day square-off). It only trades real money once you set `PAPER_TRADE=False` and `DRY_RUN=False`.
 
 **New in V7 — you only trade the last ~2 weeks of the monthly cycle.** The bot now picks the option *expiry* by how close the monthly expiry is: in the **last 15 days** before monthly expiry it offers an **actionable MONTHLY** call (the trades you take); earlier in the cycle it offers a **weekly** call tagged **TRACKING ONLY** — recorded as paper to measure performance, with no button and no real money. See "Which option you'll be offered" below.
 
 **Who does what:**
 - **You do:** the morning Kite login, and one button tap for each trade you choose to take.
 - **The bot does:** watches the market, applies every filter, sizes the trade, places the order, and manages all exits automatically.
-- **Built-in protection:** per-trade risk capped at ~**₹5,000** (1 lot), and a **₹15,000 monthly loss limit** that pauses new trades for the rest of the month if hit.
+- **Built-in protection:** fixed **1 lot** per trade (never scales up), options priced above **₹500** are skipped (worst-case ~₹9,750 risk/trade at a 30% stop), and a **₹15,000 monthly loss limit** pauses new trades for the rest of the month if hit.
 
 ---
 
@@ -170,30 +178,33 @@ If you tap a button 5 minutes late and the option has moved ₹30, the journal s
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `SL_PCT` | `0.30` | Initial stop 30% below entry; also the trailing give-back distance |
-| `USE_TRAILING_STOP` | `True` | Trailing stop, no fixed target ("let winners run"). False = old fixed SL/target |
+| `SL_PCT` | `0.30` | Initial stop 30% below entry |
+| `USE_TRAILING_STOP` | `True` | **Stepped** trailing stop, no fixed target ("let winners run"). False = old fixed SL/target |
+| `TRAIL_STEP_PCT` | `0.15` | Ladder step: the stop ratchets up 15% of entry for every 15% the option gains. Matches the validated backtest |
 | `TARGET_PCT` | `0.50` | Fixed target — **ignored when `USE_TRAILING_STOP=True`** |
 | `SQUARE_OFF_HOUR` | `15` | Hard square-off hour (IST) |
 | `SQUARE_OFF_MINUTE` | `15` | Hard square-off minute. 15:15 = 15 min before close |
 | `POSITION_POLL_SECONDS` | `60` | How often to poll the option for exit conditions |
-| `RISK_PER_TRADE_INR` | `5000` | Max rupees risked per trade; pricier options get skipped (see below) |
+| `RISK_PER_TRADE_INR` | `15000` | Sized so 1 lot always qualifies up to the premium cap (see below) |
 | `MAX_LOTS` | `1` | Hard ceiling on lots per trade — never sizes beyond one lot |
+| `MAX_PREMIUM` | `500` | Options priced above this are skipped (no button); caps worst-case risk |
 | `MONTHLY_LOSS_LIMIT_INR` | `15000` | Month's realized loss cap; pauses new trades when hit |
+
+**How the stepped stop works (validated).** The stop opens at −30% of entry and then **ratchets up in 15% steps** as the option climbs: it only lifts after each full +15% gain, and **holds between steps** instead of tightening on every tick. Example (entry ₹100): stop starts at ₹70; once the option touches ₹115 the stop steps to ₹85; at ₹130 it steps to ₹100 (breakeven); at ₹160 → ₹130; and so on. This is what lets winners run — a continuous "always 30% below the peak" trail backtested ~⅓ worse (11.7% → 7.5% net), which is why the step matters.
 
 ### Position sizing & the monthly loss limit (V4)
 
 Two guards now bound how much you can lose. Both are automatic — you don't tap anything extra.
 
-**1. Per-trade risk cap (`RISK_PER_TRADE_INR`, default ₹5,000).**
-Before showing a BUY button, the bot works out the worst case if the stop-loss hits:
+**1. Fixed 1 lot per signal, capped by premium.**
+For the live trial the bot trades a **fixed one lot (65)** on every actionable signal — matching the validated backtest, which was always 1 lot. `RISK_PER_TRADE_INR` is set to ₹15,000 purely so the risk-sizer never rounds one lot down to zero; with `MAX_LOTS = 1` it can never scale you *up* past one lot.
+
+The only thing that skips a trade is the **premium cap (`MAX_PREMIUM`, ₹500)**: options priced above ₹500 get an alert but **no button** (place manually only if you truly want it). The worst case on a taken trade is therefore:
 
 > one-lot risk = option premium × `SL_PCT` (0.30) × `LOT_SIZE` (65) = premium × 19.5
+> → at the ₹500 cap, worst-case loss ≈ **₹9,750** for one lot.
 
-- If that worst-case loss is **within ₹5,000**, you get the button for **one lot** (65).
-- If even one lot would risk **more than ₹5,000**, the trade is **skipped** — no button — and you'll see `1-lot risk ₹… > risk cap ₹5000`.
-- At ₹5,000 the cutoff is a premium of about **₹256**: cheaper options trade, pricier ones are skipped.
-
-Why one lot only? `MAX_LOTS = 1` is a hard ceiling so the cap can only ever *skip* a trade, never *scale you up* into a bigger position. This is deliberate downside protection. If you ever want the bot to take expensive trades too, raise `RISK_PER_TRADE_INR` — but understand that also raises how much you can lose on one trade.
+Why one lot only? `MAX_LOTS = 1` is a hard ceiling so sizing can only ever *skip* a trade, never scale you into a bigger position — deliberate downside protection during the live trial.
 
 **2. Monthly loss limit (`MONTHLY_LOSS_LIMIT_INR`, default ₹15,000).**
 The bot adds up your **realized** (closed) P&L for the current calendar month. Once losses for the month reach ₹15,000, it **stops offering new trades for the rest of the month** — you'll see `monthly loss limit hit`. It resets on its own at the start of the next month.
