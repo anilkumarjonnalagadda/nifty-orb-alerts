@@ -222,6 +222,14 @@ You'll get **two Telegram messages from the system before market open**:
 
 ### 8:30 AM IST — Token refresh nudge
 
+> **⛔ CRITICAL TIMING — log in only AFTER ~7:45 AM IST.** Zerodha invalidates all
+> access tokens at its morning reset (~7:30 AM). A token generated *before* the reset
+> works for a few minutes (the bot will even start fine) but is **silently killed at
+> 7:30**, and the bot then crashes at the 9:30 ORB fetch with `TokenException` — exactly
+> what happened on 2026-06-29 (logged in at 05:20). **Wait for this 8:30 nudge, then log
+> in.** Never run `auth.py` before ~7:45. (V6.2 now also re-checks the token at 9:10 and
+> alerts instead of crashing, but the fix is to log in late.)
+
 A message like:
 
 ```
@@ -256,7 +264,9 @@ https://kite.zerodha.com/connect/login?api_key=XXX&v=3
    `start.sh` first checks today's token is cached, then restarts the bot. If the
    token is missing it tells you to run `python3 auth.py` instead of failing
    silently. To stop the bot any time: `./stop.sh`.
-6. Within a minute, you should get a Telegram alert: `ORB monitor started (PAPER)`. If yes — you're done. **Close the SSH window. The bot keeps running.**
+6. Within a minute, you should get a Telegram alert: `ORB monitor started (LIVE)` (or `(PAPER)`). If yes — you're done. **Close the SSH window. The bot keeps running.**
+
+> **Watchdog (V6.2):** a cron job (`healthcheck.py`, every 10 min during market hours) pings you `⚠️ WATCHDOG: orb_monitor is NOT running` if the process ever disappears mid-session — so a silent death can't go unnoticed all day again. It alerts over Telegram, which is itself occasionally flaky on the VM, so treat a *missing* heartbeat as a prompt to glance at the bot, not a guarantee.
 
 ### Why the bot keeps running after you close SSH
 
@@ -487,7 +497,7 @@ Common errors:
 | Error contains | Fix |
 |---|---|
 | `No valid access token for today` | You forgot `python auth.py`. Run it. |
-| `TokenException` | Token expired or wrong API key/secret. Re-run `auth.py`. |
+| `TokenException` | Token invalid/expired — usually because you logged in **before the ~7:30 AM reset**. Re-run `auth.py` *after ~7:45 AM* and restart. |
 | `connection`, `timeout`, `network` | Lightsail momentarily lost network. Restart. |
 | `No active Nifty futures found` | Holiday or expiry edge case. Check NSE calendar. |
 
@@ -500,7 +510,7 @@ python -c "from telegram_alert import send_alert; send_alert('test')"
 
 ### Tapped the button but no order/confirmation came back
 1. Check `orb.log` — look for `Callback handler error:` or `ORDER FAILED`.
-2. Most likely cause: the access token expired mid-day (rare; tokens last ~24h). Re-run `auth.py`, restart the bot. The button you already tapped won't be retried — place that one manually.
+2. Most likely cause: the access token was invalidated — almost always because you logged in **before the ~7:30 AM Kite reset** (the token then dies at the reset). Re-run `auth.py` *after ~7:45 AM* and restart. The button you already tapped won't be retried — place that one manually.
 3. Could also be that the bot process died. `ps aux | grep orb_monitor | grep -v grep` — if empty, restart.
 
 ### "Auto-order skipped" on every alert

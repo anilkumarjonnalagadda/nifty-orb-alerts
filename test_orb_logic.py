@@ -91,6 +91,9 @@ from orb_monitor import (  # noqa: E402
     volume_profile,
     select_last_closed_candle,
     update_rearm_state,
+    _is_token_error,
+    ensure_kite_alive,
+    fetch_orb_candle,
 )
 import trades_db  # noqa: E402
 
@@ -1316,3 +1319,73 @@ class TestWeeklyTrackPaperOverride:
             assert row["exit_ts"] is None
         finally:
             _cfg.PAPER_TRADE, _cfg.DRY_RUN = saved_paper, saved_dry
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V6.2 — token / ORB-fetch resilience (the 2026-06-29 crash hardening)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _Kite:
+    """Minimal fake kite for resilience tests."""
+    def __init__(self, hist=None, hist_exc=None, fail_first=0, profile_exc=None):
+        self._hist = hist
+        self._hist_exc = hist_exc
+        self._fail_first = fail_first
+        self._calls = 0
+        self._profile_exc = profile_exc
+
+    def historical_data(self, *a, **k):
+        self._calls += 1
+        if self._hist_exc is not None and self._calls <= (self._fail_first or 10**9):
+            raise self._hist_exc
+        return self._hist
+
+    def profile(self):
+        if self._profile_exc is not None:
+            raise self._profile_exc
+        return {"user_id": "X"}
+
+
+class TestTokenResilience:
+
+    TOKEN_MSG = "Incorrect `api_key` or `access_token`."
+
+    def test_is_token_error_kite_message(self):
+        assert _is_token_error(Exception(self.TOKEN_MSG))
+
+    def test_is_token_error_runtime_no_token(self):
+        assert _is_token_error(RuntimeError("No valid access token for today. Run auth.py first."))
+
+    def test_is_token_error_by_class_name(self):
+        class TokenException(Exception):
+            pass
+        assert _is_token_error(TokenException("boom"))
+
+    def test_is_token_error_false_for_transient(self):
+        assert not _is_token_error(ValueError("connection timed out"))
+        assert not _is_token_error(Exception("rate limit exceeded"))
+
+    def test_fetch_orb_returns_candles(self):
+        k = _Kite(hist=[{"date": "candle"}])
+        assert fetch_orb_candle(k, 1, None, None, delay_s=0) == [{"date": "candle"}]
+
+    def test_fetch_orb_token_error_returns_none_no_retry_spam(self):
+        k = _Kite(hist_exc=Exception(self.TOKEN_MSG))
+        assert fetch_orb_candle(k, 1, None, None, retries=3, delay_s=0) is None
+        assert k._calls == 1  # token errors are terminal — don't retry
+
+    def test_fetch_orb_retries_transient_then_succeeds(self):
+        k = _Kite(hist=[{"ok": 1}], hist_exc=Exception("temporary network error"), fail_first=1)
+        assert fetch_orb_candle(k, 1, None, None, retries=3, delay_s=0) == [{"ok": 1}]
+        assert k._calls == 2
+
+    def test_fetch_orb_persistent_transient_returns_none(self):
+        k = _Kite(hist_exc=Exception("temporary network error"))
+        assert fetch_orb_candle(k, 1, None, None, retries=2, delay_s=0) is None
+        assert k._calls == 2
+
+    def test_ensure_kite_alive_true(self):
+        assert ensure_kite_alive(_Kite()) is True
+
+    def test_ensure_kite_alive_false_on_token_error(self):
+        assert ensure_kite_alive(_Kite(profile_exc=Exception(self.TOKEN_MSG))) is False

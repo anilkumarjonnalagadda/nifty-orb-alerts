@@ -892,13 +892,76 @@ def callback_listener(kite, stop_event, conn, db_lock, tracker, signal_ctx):
             time.sleep(1)
 
 
+# ── Token / ORB-fetch resilience (V6.2) ──────────────────────────────────────
+
+def _is_token_error(exc):
+    """True if an exception looks like a Kite auth/token failure — an expired
+    token, or (the common one) a token generated before the ~7:30 IST Kite reset
+    that gets invalidated at the reset. Matched on class name + message so it
+    works whether or not kiteconnect is importable (the test suite stubs it)."""
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    return ("token" in name
+            or "access_token" in msg or "access token" in msg
+            or "api_key" in msg or "api key" in msg)
+
+
+def ensure_kite_alive(kite):
+    """Lightweight liveness check — True if the access token still works. Called
+    pre-ORB so a token killed by the morning Kite reset is caught with time to
+    re-auth, not discovered at the 9:30 fetch (which is what crashed 2026-06-29)."""
+    try:
+        kite.profile()
+        return True
+    except Exception as e:
+        logger.error("Token liveness check failed: %s", e)
+        return False
+
+
+def fetch_orb_candle(kite, fut_token, market_open, orb_end, retries=3, delay_s=5):
+    """Fetch the 9:15-9:30 ORB candle with retries. On a token error, send a
+    clear actionable alert and return None so the caller exits gracefully —
+    instead of letting the exception crash the whole process. Returns the candle
+    list, or None (an alert has already been sent)."""
+    last = ""
+    for attempt in range(1, retries + 1):
+        try:
+            return kite.historical_data(fut_token, market_open, orb_end, "15minute")
+        except Exception as e:
+            last = str(e)
+            if _is_token_error(e):
+                logger.error("ORB fetch token error: %s", last)
+                send_alert(
+                    "🔴 Kite access token INVALID at ORB time. Most likely you logged in "
+                    "before the ~7:30 AM token reset. Run `python3 auth.py` (after ~7:45 AM) "
+                    "and restart the bot. No ORB set — no trades today."
+                )
+                return None
+            logger.error("ORB fetch attempt %d/%d failed: %s", attempt, retries, last)
+            if attempt < retries:
+                time.sleep(delay_s)
+    send_alert(f"🔴 ORB candle fetch failed after {retries} attempts ({last}). No trades today.")
+    return None
+
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 
 def main():
     _setup_logging()
-    kite = get_kite()
-    fut, instruments_nfo = get_nifty_fut(kite)
+    try:
+        kite = get_kite()
+        fut, instruments_nfo = get_nifty_fut(kite)
+    except Exception as e:
+        logger.exception("Startup failed: %s", e)
+        if _is_token_error(e):
+            send_alert(
+                "🔴 Startup: no valid Kite token. Run `python3 auth.py` (after ~7:45 AM, "
+                "so it survives the morning reset) and restart the bot."
+            )
+        else:
+            send_alert(f"🔴 Startup failed: {e}")
+        return
     fut_token = fut["instrument_token"]
     fut_symbol = fut["tradingsymbol"]
 
@@ -964,12 +1027,22 @@ def main():
         f"Waiting for ORB candle to close at 9:30 IST..."
     )
 
+    # Pre-ORB token liveness check (~09:10): a token killed by the ~7:30 IST Kite
+    # reset still passes the startup profile() check, so re-verify here with time
+    # to re-auth before 9:30. (No-op on a mid-day restart — wait_until returns at once.)
+    wait_until(at(9, 10))
+    if not ensure_kite_alive(kite):
+        send_alert(
+            "🔴 Kite token died before the open (most likely logged in before the ~7:30 AM "
+            "reset). Run `python3 auth.py` now and restart the bot before 9:30 to trade today."
+        )
+        return
+
     wait_until(orb_end + timedelta(seconds=30))
 
-    orb_candles = kite.historical_data(fut_token, market_open, orb_end, "15minute")
+    orb_candles = fetch_orb_candle(kite, fut_token, market_open, orb_end)
     if not orb_candles:
-        send_alert("ERROR: ORB candle unavailable. Exiting.")
-        return
+        return  # fetch_orb_candle has already sent a clear alert
 
     # FIX #4 — validate that the candle Kite returned actually starts at 9:15 AM.
     orb = orb_candles[0]
